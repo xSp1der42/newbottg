@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 from pathlib import Path
 
@@ -34,6 +33,16 @@ PLATFORM_LABELS = {
 # и контейнер перезапускается на середине рендера. Подними до 2+, если памяти
 # хватает - рендер станет заметно быстрее.
 FFMPEG_THREADS = 1
+
+# Потолок выходного кадра. НЕ путать с потоками кодировщика: память под рендер
+# ест декодирование входа плюс фильтры, и она растёт вместе с числом пикселей
+# кадра. Замеры на этой машине (ffmpeg + колорокей + overlay, вертикаль):
+#   1080x1920 @60fps, баннер 2000x1920 -> пик 362 МБ
+#   1080x1920 @60fps, баннер 1440x600  -> пик 231 МБ
+#   2160x3840 @30fps, баннер 2000x1920 -> пик 733 МБ  <-- Render убивает
+# У Render free tier 512 МБ, поэтому 4K-исходник кодировать нельзя. Любой
+# вертикальный ролик принимаем, но на выход всегда идёт не выше MAX_OUT_*.
+MAX_OUT_W, MAX_OUT_H = 1080, 1920
 
 
 def load_platforms():
@@ -309,21 +318,59 @@ def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H):
 
     Нужно, чтобы показать пользователю размер и предупредить про площадь
     ДО того, как он отправит видео в рендер на пару минут.
+
+    video_w/video_h - размер ИСХОДНИКА. Если он выше потолка, раскладка
+    считается для ужатого кадра - ровно так же, как это делает build_filter.
     """
     banner_path = Path(banner_path)
     banner_w, banner_h, _ = probe(banner_path)
 
-    plan = plan_overlay(platform, video_w, video_h, banner_w, banner_h, config)
+    out_w, out_h = out_size(video_w, video_h)
+    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config)
     plan["banner_size"] = (banner_w, banner_h)
+    plan["src_size"] = (video_w, video_h)
+    plan["out_size"] = (out_w, out_h)
+    plan["downscaled"] = (out_w, out_h) != (video_w, video_h)
     return plan
 
 
+def out_size(video_w, video_h):
+    """Размер выходного кадра: не выше MAX_OUT_W x MAX_OUT_H, пропорции 9:16
+    сохраняем. Исходник меньше потолка не растягиваем - апскейл ничего не даёт,
+    а только жрёт память и место."""
+    if video_w <= MAX_OUT_W and video_h <= MAX_OUT_H:
+        return video_w, video_h
+    scale = min(MAX_OUT_W / video_w, MAX_OUT_H / video_h)
+    return max(2, int(round(video_w * scale)) // 2 * 2), max(2, int(round(video_h * scale)) // 2 * 2)
+
+
 def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma, duration):
-    plan = plan_overlay(platform, video_w, video_h, banner_w, banner_h, config)
+    out_w, out_h = out_size(video_w, video_h)
+
+    # Сначала ужимаем исходник до потолка, и уже на ужатом кадре считаем
+    # раскладку баннера: safe box и координаты должны быть в координатах
+    # выходного кадра, иначе баннер уедет.
+    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config)
     pos_x, pos_y = plan["pos"]
     bw, bh = plan["size"]
+    plan["src_size"] = (video_w, video_h)
+    plan["out_size"] = (out_w, out_h)
+    plan["downscaled"] = (out_w, out_h) != (video_w, video_h)
 
-    chains = [f"[1:v]scale={bw}:{bh}:force_original_aspect_ratio=decrease[banner_raw]"]
+    chains = []
+    if plan["downscaled"]:
+        # scale ДО overlay: декодированный кадр 4K ужимается сразу, поэтому
+        # колорокей и наложение работают уже с 1080x1920 и не держат в памяти
+        # четыре мегапикселя на каждый буферизованный кадр.
+        chains.append(
+            f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
+            f"setsar=1[src]"
+        )
+        vsrc = "src"
+    else:
+        vsrc = "0:v"
+
+    chains.append(f"[1:v]scale={bw}:{bh}:force_original_aspect_ratio=decrease[banner_raw]")
 
     if chroma:
         chains.append(
@@ -333,7 +380,8 @@ def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma,
         chains.append("[banner_raw]null[banner_keyed]")
 
     chains.append(
-        "[0:v][banner_keyed]overlay={}:{}:eof_action=repeat:shortest=0:format=auto[outv]".format(pos_x, pos_y)
+        f"[{vsrc}][banner_keyed]overlay={pos_x}:{pos_y}:"
+        f"eof_action=repeat:shortest=0:format=auto[outv]"
     )
     return ";".join(chains), plan
 
@@ -345,7 +393,10 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     ext = Path(banner_vid).suffix.lstrip(".").lower()
     chroma = resolve_chroma(config, banner_vid)
 
-    cmd = ["ffmpeg", "-y", "-i", str(input_vid)]
+    # -hide_banner и -loglevel error: ffmpeg иначе печатает баннер и построчный
+    # прогресс (для 59-секундного ролика это десятки килобайт), которые мы
+    # затем держим в памяти процесса вместо того, чтобы просто отбросить.
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(input_vid)]
 
     # Зацикливаем баннер, чтобы он шёл всю длину ролика.
     if ext in ANIM_EXT:
@@ -358,10 +409,11 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     filters, plan = build_filter(platform, vw, vh, bw, bh, config, chroma, duration)
     plan["chroma"] = chroma
 
-    # Экономим память: Render free tier даёт 512 МБ, и x264 на вертикальном
-    # 1080x1920 с несколькими потоками выедает память и контейнер падает
-    # с OOM прямо посреди рендера (пользователь видит "⏳ Рендер..." и вечность).
-    # Один поток + ultrafast + узкий bufsize удерживают пик в рамках.
+    # Один поток и ultrafast держат кодировщик скромным, но основную память ест
+    # декодирование исходника и буферы фильтров - они растут с числом пикселей.
+    # Потолок выходного кадра задаёт out_size() и build_filter() (scale ДО
+    # overlay), а не этот список: 2160x3840 на Render free tier с 512 МБ
+    # выедал 733 МБ и контейнер убивало с OOM.
     cmd += [
         "-filter_complex", filters,
         "-map", "[outv]",
@@ -394,8 +446,12 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
 def render(input_vid, banner_vid, out_vid, platform, brand):
     _, _, duration = probe(input_vid)
     cmd, plan = build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration)
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+
+    # subprocess.run сам вычитывает stderr в фоне, поэтому ffmpeg не встанет
+    # на записи в полный канал. В PIPE оставляем только ошибки - прогресс
+    # отключён флагами выше.
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.strip().splitlines()[-12:])
+        tail = "\n".join((proc.stderr or "").strip().splitlines()[-12:])
         raise RuntimeError(f"ffmpeg упал (код {proc.returncode}):\n{tail}")
     return plan

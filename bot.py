@@ -26,6 +26,11 @@ dp = Dispatcher()
 
 MAX_DURATION = 59
 
+# Рендер ОДИН за раз. Замеры: ролик 1080x1920@60 на insta ест 415 МБ из 512 МБ
+# контейнера. Два параллельных ffmpeg - это 800 МБ, и Render убьёт контейнер
+# с OOM, уронив рендеры обоих. Второй и последующие ждут в очереди.
+render_lock = asyncio.Lock()
+
 
 class VideoState(StatesGroup):
     chosen_platform = State()
@@ -183,7 +188,7 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
         "дальше всё сделает бот сам.",
         "",
         "<i>Требования к ролику:</i>",
-        f"• вертикальный, 9:16 (1080×1920)",
+        "• вертикальный, 9:16 (лучше всего 1080×1920)",
         f"• до {MAX_DURATION} секунд",
     ]
     if plan:
@@ -227,6 +232,21 @@ async def process_video(message: Message, state: FSMContext):
             parse_mode="HTML",
         )
 
+    # 4K не декодируется в 512 МБ: замеры показали 534 МБ на голом декоде
+    # 2160x3840 и ~660 МБ с колоркеем и наложением, поэтому Render убивал
+    # контейнер с OOM. Ролик выше 1080x1920 просим пережать ДО отправки,
+    # а не убиваем им сервер.
+    if (message.video.width or 0) > render.MAX_OUT_W or (message.video.height or 0) > render.MAX_OUT_H:
+        return await message.answer(
+            f"❌ Слишком большое разрешение: <b>{message.video.width}×{message.video.height}</b>.\n\n"
+            f"Рендер идёт на {render.MAX_OUT_W}×{render.MAX_OUT_H} (это 9:16), "
+            f"а 4K на хостинге не декодируется — память кончается и бот падает.\n\n"
+            f"📱 Как пережать на телефоне: открой ролик → <b>Поделиться</b> → "
+            f"<b>Сохранить видео</b> — iPhone сам отдаст 1080p. "
+            f"Либо в настройках камеры снимай в 1080p, а не 4K.",
+            parse_mode="HTML",
+        )
+
     if not banner_path:
         expected = (config.get("media_by_platform") or {}).get(platform) \
             or config.get("media") or "banner.mp4"
@@ -252,29 +272,42 @@ async def process_video(message: Message, state: FSMContext):
         await bot.download_file(tg_file.file_path, destination=in_vid)
 
         vw, vh, _ = render.probe(in_vid)
+        ow, oh = render.out_size(vw, vh)
         platform_label = render.PLATFORM_LABELS.get(platform, platform.upper())
 
         async def keep_alive():
-            """Пока ffmpeg жуёт CPU в отдельном потоке, трогаем сообщение:
+            """Пока ffmpeg работает в отдельном потоке, трогаем сообщение:
             так юзер видит, что бот жив, а не завис намертво."""
             started = asyncio.get_running_loop().time()
             while True:
                 await asyncio.sleep(20)
                 spent = int(asyncio.get_running_loop().time() - started)
+                extra = ""
+                if (ow, oh) != (vw, vh):
+                    extra = f" Исходник {vw}×{vh} ужимается до {ow}×{oh}, чтобы влезать в память."
                 try:
                     await msg.edit_text(
                         f"⏳ <b>Рендер идёт</b> · {label} · {platform_label}\n"
-                        f"<i>Кадр {vw}×{vh}, прошло {spent} сек. "
-                        f"Рендер идёт в один поток — это медленно, но стабильно.</i>"
+                        f"<i>Прошло {spent} сек.{extra}</i>"
                     )
                 except Exception:
                     pass
 
-        ticker = asyncio.create_task(keep_alive())
-        try:
-            plan = await asyncio.to_thread(render.render, in_vid, banner_path, out_vid, platform, brand)
-        finally:
-            ticker.cancel()
+        # Рендер строго по одному: два параллельных ffmpeg на 512 МБ не
+        # помещаются. Если рендер уже идёт - честно говорим про очередь.
+        if render_lock.locked():
+            await msg.edit_text(
+                "⏳ <b>Рендер занят</b> — предыдущий ролик ещё собирается.\n"
+                "<i>Твой встанет в очередь, начну сразу, как освободится.</i>",
+                parse_mode="HTML",
+            )
+
+        async with render_lock:
+            ticker = asyncio.create_task(keep_alive())
+            try:
+                plan = await asyncio.to_thread(render.render, in_vid, banner_path, out_vid, platform, brand)
+            finally:
+                ticker.cancel()
 
         pos_x, pos_y = plan["pos"]
         bw, bh = plan["size"]
