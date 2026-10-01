@@ -35,6 +35,7 @@ render_lock = asyncio.Lock()
 class VideoState(StatesGroup):
     chosen_platform = State()
     chosen_brand = State()
+    chosen_position = State()
     waiting_for_video = State()
 
 
@@ -73,6 +74,12 @@ def brand_button_text(brand: str, platform: str | None = None) -> str:
     if not render.find_banner(brand, config, platform=platform):
         marks.append("❌ нет файла")
     return f"{label} · {' · '.join(marks)}"
+
+
+POSITION_HINT = (
+    "<i>Справа варианта нет: там кнопки интерфейса площадки — "
+    "лайк, коммент, репост. Баннер под ними всё равно не читается.</i>"
+)
 
 
 def get_brands_keyboard(platform: str | None = None):
@@ -134,6 +141,113 @@ async def process_platform(callback: CallbackQuery, state: FSMContext):
     )
 
 
+def get_positions_keyboard():
+    builder = InlineKeyboardBuilder()
+    for position in render.POSITIONS:
+        builder.button(
+            text=render.POSITION_LABELS[position],
+            callback_data=f"pos_{position}",
+        )
+    builder.button(text="🔙 Назад", callback_data="back_to_brands")
+    builder.adjust(2, 2)
+    return builder.as_markup()
+
+
+async def send_ready_message(message: Message, platform: str, brand: str, position: str):
+    """Финальная карточка перед отправкой ролика: что выбрано, куда ляжет
+    баннер и сколько он занимает. Реклама обещаний не даём - только цифры."""
+    config = render.load_brand(brand)
+    label = render.BRAND_LABELS.get(brand, config.get("title", brand))
+    platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
+
+    per_platform = config.get("media_by_platform") or {}
+    expected = per_platform.get(platform) or config.get("media") or "banner.mp4"
+    banner_path = render.find_banner(brand, config, platform=platform)
+
+    # Считаем раскладку заранее, чтобы предупредить про площадь сразу,
+    # а не через 3 минуты ожидания рендера.
+    plan = None
+    try:
+        plan = render.plan_banner(platform, banner_path, config, position=position)
+    except Exception:
+        pass
+
+    bw, bh = plan["size"] if plan else (0, 0)
+    lines = [
+        "🟢 <b>Готово. Теперь скинь видео.</b>",
+        "",
+        f"Формат: <b>{platform_label}</b>",
+        f"Бренд: <b>{label}</b>",
+        f"Баннер: <code>{banner_path.name}</code> · {render.POSITION_LABELS[position]}",
+        "",
+        "📎 <b>Прикрепи ролик файлом</b> или запиши кружочек — "
+        "дальше всё сделает бот сам.",
+        "",
+        "<i>Требования к ролику:</i>",
+        "• вертикальный, 9:16 (лучше всего 1080×1920)",
+        f"• до {MAX_DURATION} секунд",
+    ]
+    if plan:
+        lines.append(f"• баннер ляжет в безопасную зону, {bw}×{bh}")
+
+    if plan and not plan["min_area_met"]:
+        if plan.get("area_capped_by_position"):
+            lines += [
+                "",
+                f"⚠️ <i>Слева баннер занимает {plan['area_ratio'] * 100:.0f}% экрана, "
+                f"а ТЗ требует {plan['min_area_ratio'] * 100:.0f}%. Слева для этого мало "
+                f"места — баннер упёрся в безопасную зону, дальше растягивать нельзя. "
+                f"Рендер пойдёт, но площадь недобор: если важен размер, бери "
+                f"«Снизу» или «По центру».</i>",
+            ]
+        else:
+            lines += [
+                "",
+                f"⚠️ <i>Баннер займёт {plan['area_ratio'] * 100:.0f}% экрана, "
+                f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}% — пропорции баннера "
+                f"слишком вытянутые. Рендер всё равно пойдёт, но площадь недобор.</i>",
+            ]
+
+    await message.edit_text("\n".join(lines), parse_mode="HTML")
+
+
+@dp.callback_query(F.data.startswith("pos_"))
+async def process_position(callback: CallbackQuery, state: FSMContext):
+    if not await is_subscribed(callback.from_user.id):
+        return
+    position = callback.data.split("_", 1)[1]
+    if position not in render.POSITIONS:
+        await callback.answer("❌ Неизвестная позиция", show_alert=True)
+        return
+
+    data = await state.get_data()
+    platform = data.get("chosen_platform")
+    brand = data.get("chosen_brand")
+    if not platform or not brand:
+        await state.clear()
+        return await callback.message.edit_text(
+            "❌ Сначала выбери платформу и бренд.",
+            reply_markup=get_platforms_keyboard(),
+        )
+
+    await state.update_data(chosen_position=position)
+    await state.set_state(VideoState.waiting_for_video)
+    await send_ready_message(callback.message, platform, brand, position)
+
+
+@dp.callback_query(F.data == "back_to_brands")
+async def back_to_brands(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    platform = data.get("chosen_platform")
+    await state.set_state(VideoState.chosen_brand)
+    label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
+    await callback.message.edit_text(
+        f"✅ Формат: <b>{label}</b>\n\nВыбери бренд:",
+        reply_markup=get_brands_keyboard(platform=platform),
+        parse_mode="HTML",
+    )
+
+
 @dp.callback_query(F.data.startswith("brand_"))
 async def process_brand(callback: CallbackQuery, state: FSMContext):
     if not await is_subscribed(callback.from_user.id):
@@ -146,7 +260,7 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(chosen_brand=brand)
-    await state.set_state(VideoState.waiting_for_video)
+    await state.set_state(VideoState.chosen_position)
 
     data = await state.get_data()
     platform = data.get("chosen_platform")
@@ -168,41 +282,14 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
             parse_mode="HTML",
         )
 
-    # Считаем раскладку заранее, чтобы предупредить про площадь сразу,
-    # а не через 3 минуты ожидания рендера.
-    plan = None
-    try:
-        plan = render.plan_banner(platform, banner_path, config)
-    except Exception:
-        pass
-
-    bw, bh = plan["size"] if plan else (0, 0)
-    lines = [
-        "🟢 <b>Готово. Теперь скинь видео.</b>",
-        "",
-        f"Формат: <b>{platform_label}</b>",
-        f"Бренд: <b>{label}</b>",
-        f"Баннер: <code>{banner_path.name}</code>",
-        "",
-        "📎 <b>Прикрепи ролик файлом</b> или запиши кружочек — "
-        "дальше всё сделает бот сам.",
-        "",
-        "<i>Требования к ролику:</i>",
-        "• вертикальный, 9:16 (лучше всего 1080×1920)",
-        f"• до {MAX_DURATION} секунд",
-    ]
-    if plan:
-        lines.append(f"• баннер ляжет в безопасную зону, {bw}×{bh}")
-
-    if plan and not plan["min_area_met"]:
-        lines += [
-            "",
-            f"⚠️ <i>Баннер займёт {plan['area_ratio'] * 100:.0f}% экрана, "
-            f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}% — пропорции баннера "
-            f"слишком вытянутые. Рендер всё равно пойдёт, но площадь недобор.</i>",
-        ]
-
-    await callback.message.edit_text("\n".join(lines), parse_mode="HTML")
+    await callback.message.edit_text(
+        f"✅ Формат: <b>{platform_label}</b>\n"
+        f"Бренд: <b>{label}</b>\n\n"
+        f"Где поставить баннер?\n\n"
+        f"{POSITION_HINT}",
+        reply_markup=get_positions_keyboard(),
+        parse_mode="HTML",
+    )
 
 
 @dp.message(VideoState.waiting_for_video, F.video)
@@ -221,6 +308,10 @@ async def process_video(message: Message, state: FSMContext):
 
     config = render.load_brand(brand)
     banner_path = render.find_banner(brand, config, platform=platform)
+    # Позицию нормализуем здесь: в state могли прийти мусорные данные, а
+    # resolve_position гарантирует одну из POSITIONS и не даёт баннеру уехать
+    # под кнопки интерфейса.
+    position = render.resolve_position(config, data.get("chosen_position"))
 
     # Отсекаем горизонтальные ролики: safe zones заданы под вертикальный 9:16,
     # на альбомном кадре баннер уедет в неправильное место.
@@ -259,8 +350,10 @@ async def process_video(message: Message, state: FSMContext):
 
     label = render.BRAND_LABELS.get(brand, brand.upper())
     platform_label = render.PLATFORM_LABELS.get(platform, platform.upper())
+    position_label = render.POSITION_LABELS[position]
     msg = await message.answer(
-        f"⏳ Скачиваю ролик и рендерю <b>{label}</b> на {platform_label}...",
+        f"⏳ Скачиваю ролик и рендерю <b>{label}</b> на {platform_label} "
+        f"({position_label})...",
         parse_mode="HTML",
     )
 
@@ -306,7 +399,9 @@ async def process_video(message: Message, state: FSMContext):
         async with render_lock:
             ticker = asyncio.create_task(keep_alive())
             try:
-                plan = await asyncio.to_thread(render.render, in_vid, banner_path, out_vid, platform, brand)
+                plan = await asyncio.to_thread(
+                    render.render, in_vid, banner_path, out_vid, platform, brand, position
+                )
             finally:
                 ticker.cancel()
 
@@ -314,17 +409,25 @@ async def process_video(message: Message, state: FSMContext):
         bw, bh = plan["size"]
         warn = ""
         if not plan["min_area_met"]:
-            warn = (
-                f"\n⚠️ Баннер занимает {plan['area_ratio'] * 100:.1f}% экрана, "
-                f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}%. При таких пропорциях "
-                f"баннера это физически недостижимо без выхода за безопасную зону - "
-                f"используй баннер покрупнее."
-            )
+            if plan.get("area_capped_by_position"):
+                warn = (
+                    f"\n⚠️ Баннер занимает {plan['area_ratio'] * 100:.1f}% экрана, "
+                    f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}%. Слева для этого "
+                    f"физически не хватает места в безопасной зоне — рендер прошёл, "
+                    f"но площадь недобор."
+                )
+            else:
+                warn = (
+                    f"\n⚠️ Баннер занимает {plan['area_ratio'] * 100:.1f}% экрана, "
+                    f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}%. При таких пропорциях "
+                    f"баннера это физически недостижимо без выхода за безопасную зону - "
+                    f"используй баннер покрупнее."
+                )
         await msg.edit_text("🚀 Загружаю результат...")
         await message.answer_video(
             video=FSInputFile(out_vid),
             caption=(
-                f"Готово ({label} · {platform_label})\n"
+                f"Готово ({label} · {platform_label} · {position_label})\n"
                 f"Баннер {bw}×{bh} — {plan['area_ratio'] * 100:.0f}% экрана"
                 + warn
             ),

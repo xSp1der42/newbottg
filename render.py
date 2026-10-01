@@ -29,6 +29,24 @@ PLATFORM_LABELS = {
     "shorts": "YouTube Shorts",
 }
 
+# Где может стоять баннер. "right" в списке нет намеренно: справа у TikTok,
+# Reels и Shorts живут кнопки интерфейса (лайк, коммент, репост), и баннер
+# под ними всё равно не читается. Внизу - подпись и кнопка звука, но наш
+# safe_box по площадкам там заканчивается выше, поэтому "bottom" в списке.
+POSITIONS = ("top", "center", "bottom", "left")
+POSITION_LABELS = {
+    "top": "⬆️ Сверху",
+    "center": "🎯 По центру",
+    "bottom": "⬇️ Снизу",
+    "left": "⬅️ Слева",
+}
+DEFAULT_POSITION = "bottom"
+
+# При боковом размещении баннер занимает левую часть safe box, а не всю
+# ширину: иначе "слева" и "по центру" выглядели бы одинаково, а справа всё
+# равно осталась бы пустая половина под кнопки интерфейса.
+LEFT_COL_RATIO = 0.55
+
 # Потоки ffmpeg. По умолчанию 1: на хостинге с маленькой памятью (Render free
 # tier - 512 МБ) многопоточный x264 на вертикальном 1080x1920 упирается в OOM
 # и контейнер перезапускается на середине рендера. Подними до 2+, если памяти
@@ -268,33 +286,66 @@ def safe_box(platform, video_w, video_h):
     return x0, y0, x1, y1
 
 
-def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config):
+def resolve_position(config, position=None):
+    """Позиция баннера: выбор юзера, иначе настройка бренда, иначе снизу.
+
+    Поддерживается только POSITIONS. Всё остальное (включая "right" из старых
+    конфигов) молча падает на DEFAULT_POSITION, чтобы баннер гарантированно
+    не уехал под кнопки интерфейса.
+    """
+    pos = position or config.get("position") or config.get("anchor") or DEFAULT_POSITION
+    return pos if pos in POSITIONS else DEFAULT_POSITION
+
+
+def position_slot(x0, y0, x1, y1, position):
+    """Прямоугольник, внутри которого центрируется баннер.
+
+    Для top/center/bottom это весь safe box - там сверху, снизу и по центру
+    интерфейс ничего не перекрывает. Для left берём левую колонку: баннер
+    прижимается к левому краю и центрируется по вертикали, а справа остаётся
+    пустое место под кнопки площадки. Справа (right) варианта нет намеренно.
+    """
+    box_w, box_h = x1 - x0, y1 - y0
+    if position == "left":
+        col_w = max(1, int(round(box_w * LEFT_COL_RATIO)))
+        return x0, y0, x0 + col_w, y1
+    return x0, y0, x1, y1
+
+
+def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, position=None):
     """Считает финальный размер и координаты баннера внутри safe box.
     Пропорции баннера сохраняются, площадь не опускается ниже min_area_ratio."""
+    position = resolve_position(config, position)
     x0, y0, x1, y1 = safe_box(platform, video_w, video_h)
-    box_w, box_h = x1 - x0, y1 - y0
+    sx0, sy0, sx1, sy1 = position_slot(x0, y0, x1, y1, position)
+    box_w, box_h = sx1 - sx0, sy1 - sy0
 
     aspect = banner_w / banner_h if banner_h else 1.0
 
+    def even(v):
+        """Чётное значение не меньше 2. Баннер масштабируется отдельным
+        scale, и нечётный размер там ломает yuv420p так же, как на исходнике."""
+        return max(2, int(round(v)) // 2 * 2)
+
     def fit(width):
-        """Размер баннера под заданную ширину, вписанный в safe box с сохранением пропорций."""
-        w = max(1, min(int(round(width)), box_w))
-        h = max(1, int(round(w / aspect)))
+        """Размер баннера под заданную ширину, вписанный в зону с сохранением пропорций."""
+        w = min(even(width), even(box_w))
+        h = even(w / aspect)
         if h > box_h:
-            h = box_h
-            w = max(1, int(round(h * aspect)))
-            if w > box_w:
-                w = box_w
-                h = max(1, int(round(w / aspect)))
-        return w, h
+            h = even(box_h)
+            w = even(h * aspect)
+            if w > even(box_w):
+                w = even(box_w)
+                h = even(w / aspect)
+        return max(2, w), max(2, h)
 
     target_w, target_h = fit(box_w * float(config.get("width_ratio", 0.8)))
 
     # ТЗ: баннер занимает не менее 1/6 экрана. Если текущий размер мал - растягиваем
-    # до предела safe box, но пропорции и границы не нарушаем.
+    # до предела зоны, но пропорции и границы не нарушаем.
     min_area = float(config.get("min_area_ratio", 0)) * video_w * video_h
 
-    # Максимум, который вообще можно получить, не вылезая из safe box и не ломая пропорции.
+    # Максимум, который вообще можно получить, не вылезая из зоны и не ломая пропорции.
     max_area_possible = fit(box_w)[0] * fit(box_w)[1]
 
     min_area_met = target_w * target_h >= min_area
@@ -306,12 +357,20 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config):
 
     gap = int(round(box_h * float(config.get("gap_ratio", 0.06))))
 
-    if config.get("anchor") == "top":
-        pos_x = x0 + (box_w - target_w) // 2
-        pos_y = y0 + gap
-    else:
-        pos_x = x0 + (box_w - target_w) // 2
-        pos_y = y1 - target_h - gap
+    if position == "top":
+        pos_x = sx0 + (box_w - target_w) // 2
+        pos_y = sy0 + gap
+    elif position == "center":
+        pos_x = sx0 + (box_w - target_w) // 2
+        pos_y = sy0 + (box_h - target_h) // 2
+    elif position == "left":
+        # Прижимаем к левому краю зоны, вертикаль по центру: так справа от
+        # баннера остаётся максимум места под кнопки интерфейса.
+        pos_x = sx0
+        pos_y = sy0 + (box_h - target_h) // 2
+    else:  # bottom
+        pos_x = sx0 + (box_w - target_w) // 2
+        pos_y = sy1 - target_h - gap
 
     # Не даём баннеру вылезти за safe box.
     pos_x = max(x0, min(pos_x, x1 - target_w))
@@ -322,6 +381,11 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config):
         "pos": (pos_x, pos_y),
         "size": (target_w, target_h),
         "safe_box": (x0, y0, x1, y1),
+        "slot": (sx0, sy0, sx1, sy1),
+        "position": position,
+        # Позиция физически мешает набрать min_area_ratio: колонка уже, чем
+        # весь safe box. Бот предупредит мягче, чем при неудачных пропорциях.
+        "area_capped_by_position": position == "left" and not min_area_met,
         "area_ratio": round(area / (video_w * video_h), 4),
         "min_area_ratio": round(min_area / (video_w * video_h), 4) if min_area else 0,
         "min_area_met": area >= min_area,
@@ -329,7 +393,7 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config):
     }
 
 
-def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H):
+def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, position=None):
     """Считает план раскладки баннера, ничего не рендеря.
 
     Нужно, чтобы показать пользователю размер и предупредить про площадь
@@ -342,7 +406,7 @@ def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H):
     banner_w, banner_h, _ = probe(banner_path)
 
     out_w, out_h = out_size(video_w, video_h)
-    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config)
+    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config, position)
     plan["banner_size"] = (banner_w, banner_h)
     plan["src_size"] = (video_w, video_h)
     plan["out_size"] = (out_w, out_h)
@@ -360,13 +424,14 @@ def out_size(video_w, video_h):
     return max(2, int(round(video_w * scale)) // 2 * 2), max(2, int(round(video_h * scale)) // 2 * 2)
 
 
-def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma, duration):
+def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma, duration,
+                 position=None):
     out_w, out_h = out_size(video_w, video_h)
 
     # Сначала ужимаем исходник до потолка, и уже на ужатом кадре считаем
     # раскладку баннера: safe box и координаты должны быть в координатах
     # выходного кадра, иначе баннер уедет.
-    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config)
+    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config, position)
     pos_x, pos_y = plan["pos"]
     bw, bh = plan["size"]
     plan["src_size"] = (video_w, video_h)
@@ -402,7 +467,8 @@ def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma,
     return ";".join(chains), plan
 
 
-def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0.0):
+def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0.0,
+                     position=None):
     config = load_brand(brand)
     vw, vh, _ = probe(input_vid)
     bw, bh, _ = probe(banner_vid)
@@ -422,7 +488,7 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     else:
         cmd += ["-loop", "1", "-i", str(banner_vid)]
 
-    filters, plan = build_filter(platform, vw, vh, bw, bh, config, chroma, duration)
+    filters, plan = build_filter(platform, vw, vh, bw, bh, config, chroma, duration, position)
     plan["chroma"] = chroma
 
     # Один поток и ultrafast держат кодировщик скромным, но основную память ест
@@ -509,7 +575,7 @@ def _run_ffmpeg(cmd):
         raise RuntimeError(f"ffmpeg упал (код {proc.returncode}):\n{tail}")
 
 
-def render(input_vid, banner_vid, out_vid, platform, brand):
+def render(input_vid, banner_vid, out_vid, platform, brand, position=None):
     src_w, src_h, duration = probe(input_vid)
 
     # Крупный кадр ужимаем отдельным проходом: колорокей и overlay поверх
@@ -518,14 +584,16 @@ def render(input_vid, banner_vid, out_vid, platform, brand):
         with tempfile.TemporaryDirectory(prefix="prepass_") as tmp:
             mid = Path(tmp) / "mid.mp4"
             _run_ffmpeg(build_prepass_cmd(input_vid, mid, duration))
-            cmd, plan = build_ffmpeg_cmd(mid, banner_vid, out_vid, platform, brand, duration)
+            cmd, plan = build_ffmpeg_cmd(mid, banner_vid, out_vid, platform, brand,
+                                         duration, position)
             # Плану показываем исходник, а не промежуточный файл.
             plan["src_size"] = (src_w, src_h)
             plan["prepassed"] = True
             _run_ffmpeg(cmd)
         return plan
 
-    cmd, plan = build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration)
+    cmd, plan = build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand,
+                                 duration, position)
     plan["prepassed"] = False
     _run_ffmpeg(cmd)
     return plan
