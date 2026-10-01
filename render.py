@@ -47,6 +47,40 @@ DEFAULT_POSITION = "bottom"
 # равно осталась бы пустая половина под кнопки интерфейса.
 LEFT_COL_RATIO = 0.55
 
+# --- Обрезка хромакея по контенту -------------------------------------------
+# Кадр хромакеЙного баннера заметно больше того, что в нём видно: зелёный
+# фон занимает большую часть площади (insta - 1%). Если масштабировать кадр
+# целиком, контент остаётся мелким, а ТЗ по площади формально выполняется на
+# пустом зелёном фоне. Поэтому ищем bbox непрозрачных пикселей и обрезаем
+# кадр по нему - тогда размер в плане относится к тому, что реально видно.
+#
+# Порог альфы, по которому пиксель считается контентом (0-255). Держим
+# мягче обычного порога колоркея: у баннеров есть растушёванный край, и на
+# жёстком пороге он выпадает из bbox - тогда crop срезает светящуюся кромку.
+CONTENT_ALPHA_MIN = 16
+# Ищем bbox на уменьшенной копии: точность нужна только у самой границы, а
+# 2000x1920 пикселей в Python считать незачем. Плюс convert_scan8-style
+# масштаб дешёвый и одинаковый для картинок и видео.
+CONTENT_SAMPLE = 256
+# Запас вокруг найденного контента. Всё лишнее потом срезает colorkey, поэтому
+# лучше перестраховаться и не подрезать края баннера. Запас держим и от
+# квантизации замера, и от того, что баннер анимированный: контент между
+# опорными кадрами может вылезти за объединение на несколько пикселей.
+CONTENT_MARGIN_RATIO = 0.03
+# Сколько кадров берём для замера. Баннеры анимированные: контент ездит и
+# меняет размер, поэтому замер по нескольким кадрам, размазанным по всей
+# длине, иначе обрезает содержимое на середине ролика.
+CONTENT_FRAMES = 12
+# Если контент занимает почти весь кадр - обрезать нечего.
+CONTENT_CROP_MAX_FILL = 0.98
+
+# Горизонтальный вылет за safe box. Задаётся в конфиге бренда как
+# horizontal_bleed_ratio (доля ширины кадра на сторону). Вертикальный вылет
+# запрещён всегда: сверху заголовок, снизу подпись и кнопки - там интерфейс
+# перекрывает больше всего, и по вертикали safe box тонкий, но критичный.
+# Для широких баннеров (2.9:1) без вылета по бокам ТЗ по площади не
+# набирается в принципе, поэтому вылет - сознательный размен.
+
 # Потоки ffmpeg. По умолчанию 1: на хостинге с маленькой памятью (Render free
 # tier - 512 МБ) многопоточный x264 на вертикальном 1080x1920 упирается в OOM
 # и контейнер перезапускается на середине рендера. Подними до 2+, если памяти
@@ -240,6 +274,138 @@ def resolve_chroma(config, banner_path):
     }
 
 
+_CONTENT_BOX_CACHE = {}
+# translate() переводит альфу в 0/1 на скорости C, поэтому поиск границ - это
+# find() по строке, а не цикл по пикселям в Python.
+_ALPHA_MASK = bytes(1 if i > CONTENT_ALPHA_MIN else 0 for i in range(256))
+
+
+def _measure_content_box(path, chroma, sample, frames):
+    """Ищет bbox непрозрачных пикселей после colorkey. Возвращает (x, y, w, h)
+    в пикселях исходника или None.
+
+    Кадры берёмся РАСПРЕДЕЛЁННЫМИ ПО ВСЕЙ ДЛИНЕ, а не подряд с начала: баннеры
+    анимированные, контент в них ездит и меняет размер, и bbox по первым
+    кадрам обрезал бы содержимое на середине ролика. Объединяем всё в один
+    прямоугольник, чтобы не срезать контент ни на одном кадре.
+    """
+    frame_w, frame_h, duration = probe(path)
+    fps = f"fps={frames / duration:.6f}," if duration > 0 else ""
+    cmd = [
+        "ffmpeg", "-v", "error", "-i", str(path),
+        "-vf", (f"{fps}scale={sample}:{sample}:flags=area,"
+                f"colorkey={chroma['color']}:{chroma['similarity']}:{chroma['blend']},"
+                f"format=rgba"),
+        "-frames:v", str(frames),
+        "-f", "rawvideo", "-pix_fmt", "rgba", "-",
+    ]
+    raw = subprocess.run(cmd, capture_output=True).stdout
+    if not raw:
+        return None
+
+    frame_bytes = sample * sample * 4
+    count = min(len(raw) // frame_bytes, frames)
+    if count == 0:
+        return None
+
+    # Объединение по кадрам: баннер может быть анимированным, и обрезать надо
+    # так, чтобы не срезать контент ни на одном кадре. Параллельно запоминаем
+    # самый крупный кадр - по нему поймём, сколько графики видно в моменте,
+    # когда баннер развернулся полностью.
+    min_x, min_y, max_x, max_y = sample, sample, -1, -1
+    peak = 0
+    for i in range(count):
+        # Альфа - каждый 4-й байт rgba.
+        alpha = raw[i * frame_bytes + 3:(i + 1) * frame_bytes:4]
+        mask = alpha.translate(_ALPHA_MASK)
+        if b"\x01" not in mask:
+            continue
+        fmin_x, fmax_x, fmin_y, fmax_y = sample, -1, sample, -1
+        for y in range(sample):
+            row = mask[y * sample:(y + 1) * sample]
+            x0 = row.find(b"\x01")
+            if x0 < 0:
+                continue
+            x1 = sample - 1 - row[::-1].find(b"\x01")
+            fmin_x = min(fmin_x, x0)
+            fmax_x = max(fmax_x, x1)
+            fmin_y = min(fmin_y, y)
+            fmax_y = max(fmax_y, y)
+        if fmax_x < 0:
+            continue
+        min_x = min(min_x, fmin_x)
+        max_x = max(max_x, fmax_x)
+        min_y = min(min_y, fmin_y)
+        max_y = max(max_y, fmax_y)
+        peak = max(peak, (fmax_x - fmin_x + 1) * (fmax_y - fmin_y + 1))
+
+    if max_x < 0:
+        return None
+
+    # В долях кадра -> в пиксели исходника, с запасом по краям.
+    mx = frame_w * CONTENT_MARGIN_RATIO
+    my = frame_h * CONTENT_MARGIN_RATIO
+    x0 = max(0, int(min_x / sample * frame_w) - int(mx))
+    y0 = max(0, int(min_y / sample * frame_h) - int(my))
+    x1 = min(frame_w, int((max_x + 1) / sample * frame_w) + int(mx))
+    y1 = min(frame_h, int((max_y + 1) / sample * frame_h) + int(my))
+
+    # Чётные стороны: обрезанный кадр уходит дальше в scale и colorkey, а
+    # нечётная ширина на yuv420p местами даёт артефакты на краю.
+    x0 -= x0 % 2
+    y0 -= y0 % 2
+    w = min(frame_w - x0, max(2, (x1 - x0) // 2 * 2))
+    h = min(frame_h - y0, max(2, (y1 - y0) // 2 * 2))
+
+    if w * h >= frame_w * frame_h * CONTENT_CROP_MAX_FILL:
+        return None  # контент почти во весь кадр, обрезать нечего
+
+    # Доля объединения, которую занимает самый крупный кадр. У анимированного
+    # баннера графика ездит внутри объединения, поэтому даже когда слот равен
+    # 18% кадра, в кадре видно меньше - и это надо показывать честно.
+    union_cells = (max_x - min_x + 1) * (max_y - min_y + 1)
+    fill = peak / union_cells if union_cells else 1.0
+    return (x0, y0, w, h), round(fill, 3)
+
+
+def detect_content_box(banner_path, config, chroma=None, sample=CONTENT_SAMPLE,
+                       frames=CONTENT_FRAMES, with_fill=False):
+    """Прямоугольник с видимым контентом баннера в пикселях исходника.
+
+    Только для хромакеЙных баннеров: у них кадр шире контента, и без обрезки
+    план считает площадь зелёного фона вместо площади баннера. Возвращает
+    (x, y, w, h) или None - тогда баннер планируем по всему кадру.
+
+    with_fill=True отдаёт ещё и заполнение объединения самым крупным кадром
+    (0..1): у анимированного баннера графика ездит внутри обрезанной области,
+    и по одной площади слота нельзя сказать, сколько видно в кадре.
+
+    Результат кэшируется по файлу: plan_banner считается для карточки перед
+    рендером и потом ещё раз внутри build_ffmpeg_cmd, а каждый замер - это
+    ffmpeg с чтением кадров.
+    """
+    chroma = chroma or resolve_chroma(config, banner_path)
+    if not chroma:
+        return None if not with_fill else (None, 1.0)
+
+    path = Path(banner_path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None if not with_fill else (None, 1.0)
+    key = (str(path), stat.st_mtime_ns, stat.st_size, chroma["color"])
+    if key not in _CONTENT_BOX_CACHE:
+        try:
+            _CONTENT_BOX_CACHE[key] = _measure_content_box(path, chroma, sample, frames)
+        except (OSError, ValueError, subprocess.SubprocessError, RuntimeError):
+            # Не смогли померить - планируем по всему кадру, как раньше.
+            _CONTENT_BOX_CACHE[key] = None
+    got = _CONTENT_BOX_CACHE[key]
+    if not with_fill:
+        return got[0] if got else None
+    return (got[0], got[1]) if got else (None, 1.0)
+
+
 
 def probe(path):
     """Возвращает (w, h, duration) из ffprobe."""
@@ -312,15 +478,30 @@ def position_slot(x0, y0, x1, y1, position):
     return x0, y0, x1, y1
 
 
-def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, position=None):
-    """Считает финальный размер и координаты баннера внутри safe box.
-    Пропорции баннера сохраняются, площадь не опускается ниже min_area_ratio."""
+def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, position=None,
+                 content_box=None, content_fill=1.0):
+    """Считает финальный размер и координаты баннера.
+
+    content_box - (x, y, w, h) с видимым контентом хромакеЙного баннера в
+    пикселях исходника. Когда он задан, планируем размер ИМЕННО контента:
+    зелёный фон в кадре не считается, его срезает crop в build_filter. Без
+    content_box поведение прежнее - размер считается по всему кадру.
+
+    content_fill - какая доля объединения занята самым крупным кадром
+    анимации. Нужна, чтобы показать в плане не только размер слота, но и
+    реально видимую площадь: у анимированного баннера они различаются.
+    """
     position = resolve_position(config, position)
     x0, y0, x1, y1 = safe_box(platform, video_w, video_h)
     sx0, sy0, sx1, sy1 = position_slot(x0, y0, x1, y1, position)
-    box_w, box_h = sx1 - sx0, sy1 - sy0
+    slot_w, slot_h = sx1 - sx0, sy1 - sy0
 
-    aspect = banner_w / banner_h if banner_h else 1.0
+    # Пропорции берём у того, что реально видно.
+    if content_box:
+        src_w, src_h = content_box[2], content_box[3]
+    else:
+        src_w, src_h = banner_w, banner_h
+    aspect = src_w / src_h if src_h else 1.0
 
     def even(v):
         """Чётное значение не меньше 2. Баннер масштабируется отдельным
@@ -329,51 +510,96 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, positio
 
     def fit(width):
         """Размер баннера под заданную ширину, вписанный в зону с сохранением пропорций."""
-        w = min(even(width), even(box_w))
+        w = min(even(width), even(slot_w))
         h = even(w / aspect)
-        if h > box_h:
-            h = even(box_h)
+        if h > slot_h:
+            h = even(slot_h)
             w = even(h * aspect)
-            if w > even(box_w):
-                w = even(box_w)
+            if w > even(slot_w):
+                w = even(slot_w)
                 h = even(w / aspect)
         return max(2, w), max(2, h)
 
-    target_w, target_h = fit(box_w * float(config.get("width_ratio", 0.8)))
+    min_area_ratio = float(config.get("min_area_ratio", 0))
+    min_area = min_area_ratio * video_w * video_h
 
-    # ТЗ: баннер занимает не менее 1/6 экрана. Если текущий размер мал - растягиваем
-    # до предела зоны, но пропорции и границы не нарушаем.
-    min_area = float(config.get("min_area_ratio", 0)) * video_w * video_h
+    # Потолок по ширине. В safe box баннер влезает не всегда: у баннера 2.9:1
+    # по бокам нужно 1016px ради 17% площади, а safe box шириной 840. По
+    # вертикали safe box не трогаем - там подпись, заголовок и кнопки.
+    bleed_ratio = 0.0 if position == "left" else float(config.get("horizontal_bleed_ratio", 0))
+    bleed = int(round(bleed_ratio * video_w))
+    max_w = even(min(video_w, slot_w + 2 * bleed))
+
+    def fit_area(area):
+        """Наибольший размер с площадью не больше area, вписанный в лимиты."""
+        if area <= 0:
+            return 2, 2
+        w = (area * aspect) ** 0.5
+        h = w / aspect
+        if w > max_w:
+            w = max_w
+            h = w / aspect
+        if h > slot_h:
+            h = even(slot_h)
+            w = even(h * aspect)
+            if w > max_w:
+                w = max_w
+                h = even(w / aspect)
+        return max(2, even(w)), max(2, even(h))
+
+    # ТЗ по площади. Считать площадь по контенту можно ТОЛЬКО когда мы его
+    # знаем: иначе зелёный фон хромакея попал бы в площадь, и мы бы снова
+    # получили ТЗ на пустом кадре. Поэтому без content_box работает старая
+    # логика - размер по ширине слота.
+    use_area = content_box is not None
+    target_area_ratio = (float(config.get("target_area_ratio", 0)) or min_area_ratio) \
+        if use_area else 0.0
+    if target_area_ratio > 0:
+        target_w, target_h = fit_area(target_area_ratio * video_w * video_h)
+    else:
+        target_w, target_h = fit(slot_w * float(config.get("width_ratio", 0.8)))
+
+    if target_w * target_h < min_area:
+        bigger = fit_area(min_area) if target_area_ratio > 0 else fit(slot_w)
+        if bigger[0] * bigger[1] > target_w * target_h:
+            target_w, target_h = bigger
 
     # Максимум, который вообще можно получить, не вылезая из зоны и не ломая пропорции.
-    max_area_possible = fit(box_w)[0] * fit(box_w)[1]
+    max_possible = fit_area(float("inf")) if target_area_ratio > 0 else fit(slot_w)
 
     min_area_met = target_w * target_h >= min_area
-    if not min_area_met:
-        full_w, full_h = fit(box_w)
-        if full_w * full_h > target_w * target_h:
-            target_w, target_h = full_w, full_h
-        min_area_met = target_w * target_h >= min_area
+    gap = int(round(slot_h * float(config.get("gap_ratio", 0.06))))
 
-    gap = int(round(box_h * float(config.get("gap_ratio", 0.06))))
-
-    if position == "top":
-        pos_x = sx0 + (box_w - target_w) // 2
-        pos_y = sy0 + gap
-    elif position == "center":
-        pos_x = sx0 + (box_w - target_w) // 2
-        pos_y = sy0 + (box_h - target_h) // 2
-    elif position == "left":
+    if position == "left":
         # Прижимаем к левому краю зоны, вертикаль по центру: так справа от
         # баннера остаётся максимум места под кнопки интерфейса.
         pos_x = sx0
-        pos_y = sy0 + (box_h - target_h) // 2
+    elif target_w <= slot_w:
+        pos_x = sx0 + (slot_w - target_w) // 2
+    else:
+        # Баннер шире safe box - центрируем по кадру, иначе он уедет влево.
+        pos_x = (video_w - target_w) // 2
+        # Центрировка по кадру не уважает разрешённый вылет, если safe box
+        # несимметричный (у shorts отступы 48/192 - при центрировке правый
+        # вылет получался 129px при разрешённых 108). Поэтому сдвигаем баннер
+        # внутрь окна [x0 - bleed, x1 + bleed], не давая вылету превысить
+        # разрешённый ни с одной стороны.
+        lo, hi = x0 - bleed, x1 + bleed - target_w
+        if lo <= hi:
+            pos_x = max(lo, min(pos_x, hi))
+        else:
+            # Вылет не покрывает даже ширину баннера - прижимаем к левому краю.
+            pos_x = x0
+
+    if position == "top":
+        pos_y = sy0 + gap
+    elif position in ("center", "left"):
+        pos_y = sy0 + (slot_h - target_h) // 2
     else:  # bottom
-        pos_x = sx0 + (box_w - target_w) // 2
         pos_y = sy1 - target_h - gap
 
-    # Не даём баннеру вылезти за safe box.
-    pos_x = max(x0, min(pos_x, x1 - target_w))
+    # По вертикали держим safe box, по горизонтали - кадр (там разрешён вылет).
+    pos_x = max(0, min(pos_x, video_w - target_w))
     pos_y = max(y0, min(pos_y, y1 - target_h))
 
     area = target_w * target_h
@@ -383,13 +609,24 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, positio
         "safe_box": (x0, y0, x1, y1),
         "slot": (sx0, sy0, sx1, sy1),
         "position": position,
+        "content_box": content_box,
+        "content_size": (src_w, src_h),
+        # Насколько контент растянули. Больше 1.5 - уже видно мыло: исходник
+        # мелкий, и правильное решение - отдать баннер покрупнее.
+        "upscale": round(target_w / src_w, 2) if src_w else 1.0,
         # Позиция физически мешает набрать min_area_ratio: колонка уже, чем
         # весь safe box. Бот предупредит мягче, чем при неудачных пропорциях.
         "area_capped_by_position": position == "left" and not min_area_met,
         "area_ratio": round(area / (video_w * video_h), 4),
+        # Сколько графики реально видно в самом крупном кадре анимации. Для
+        # неподвижного баннера совпадает с area_ratio, для анимированного
+        # меньше: контент ездит внутри отведённого слота.
+        "visible_area_ratio": round(area / (video_w * video_h) * content_fill, 4),
+        "content_fill": round(content_fill, 3),
         "min_area_ratio": round(min_area / (video_w * video_h), 4) if min_area else 0,
         "min_area_met": area >= min_area,
-        "max_possible_area_ratio": round(max_area_possible / (video_w * video_h), 4),
+        "max_possible_area_ratio": round(max_possible[0] * max_possible[1]
+                                         / (video_w * video_h), 4),
     }
 
 
@@ -404,9 +641,11 @@ def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, pos
     """
     banner_path = Path(banner_path)
     banner_w, banner_h, _ = probe(banner_path)
+    content_box, content_fill = detect_content_box(banner_path, config, with_fill=True)
 
     out_w, out_h = out_size(video_w, video_h)
-    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config, position)
+    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config, position,
+                        content_box, content_fill)
     plan["banner_size"] = (banner_w, banner_h)
     plan["src_size"] = (video_w, video_h)
     plan["out_size"] = (out_w, out_h)
@@ -425,13 +664,14 @@ def out_size(video_w, video_h):
 
 
 def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma, duration,
-                 position=None):
+                 position=None, content_box=None, content_fill=1.0):
     out_w, out_h = out_size(video_w, video_h)
 
     # Сначала ужимаем исходник до потолка, и уже на ужатом кадре считаем
     # раскладку баннера: safe box и координаты должны быть в координатах
     # выходного кадра, иначе баннер уедет.
-    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config, position)
+    plan = plan_overlay(platform, out_w, out_h, banner_w, banner_h, config, position,
+                        content_box, content_fill)
     pos_x, pos_y = plan["pos"]
     bw, bh = plan["size"]
     plan["src_size"] = (video_w, video_h)
@@ -451,7 +691,17 @@ def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma,
     else:
         vsrc = "0:v"
 
-    chains.append(f"[1:v]scale={bw}:{bh}:force_original_aspect_ratio=decrease[banner_raw]")
+    # Обрезка хромакея по контенту ДО scale: зелёные поля не масштабируются
+    # (дешевле и не мылит край), а плановый размер достаётся видимому
+    # контенту, а не пустому фону.
+    if content_box:
+        cx, cy, cw, ch = content_box
+        chains.append(
+            f"[1:v]crop={cw}:{ch}:{cx}:{cy},"
+            f"scale={bw}:{bh}:force_original_aspect_ratio=decrease[banner_raw]"
+        )
+    else:
+        chains.append(f"[1:v]scale={bw}:{bh}:force_original_aspect_ratio=decrease[banner_raw]")
 
     if chroma:
         chains.append(
@@ -474,6 +724,7 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     bw, bh, _ = probe(banner_vid)
     ext = Path(banner_vid).suffix.lstrip(".").lower()
     chroma = resolve_chroma(config, banner_vid)
+    content_box, content_fill = detect_content_box(banner_vid, config, chroma, with_fill=True)
 
     # -hide_banner и -loglevel error: ffmpeg иначе печатает баннер и построчный
     # прогресс (для 59-секундного ролика это десятки килобайт), которые мы
@@ -488,7 +739,8 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     else:
         cmd += ["-loop", "1", "-i", str(banner_vid)]
 
-    filters, plan = build_filter(platform, vw, vh, bw, bh, config, chroma, duration, position)
+    filters, plan = build_filter(platform, vw, vh, bw, bh, config, chroma, duration,
+                                 position, content_box, content_fill)
     plan["chroma"] = chroma
 
     # Один поток и ultrafast держат кодировщик скромным, но основную память ест

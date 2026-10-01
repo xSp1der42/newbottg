@@ -188,7 +188,16 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
         f"• до {MAX_DURATION} секунд",
     ]
     if plan:
-        lines.append(f"• баннер ляжет в безопасную зону, {bw}×{bh}")
+        # Показываем и область баннера, и то, сколько графики реально видно:
+        # у анимированного баннера контент ездит внутри отведённой области, и
+        # без второй цифры пользователь снова увидит «мелкий баннер».
+        fill = plan.get("content_fill", 1.0)
+        lines.append(f"• баннер ляжет в безопасную зону, {bw}×{bh} "
+                     f"({plan['area_ratio'] * 100:.0f}% экрана)")
+        if fill < 0.95:
+            lines.append(f"• графика анимирована: видно от "
+                         f"{plan['visible_area_ratio'] * 100:.0f}% экрана в момент, "
+                         f"когда она развернулась полностью, и меньше, когда сжата")
 
     if plan and not plan["min_area_met"]:
         if plan.get("area_capped_by_position"):
@@ -423,12 +432,19 @@ async def process_video(message: Message, state: FSMContext):
                     f"баннера это физически недостижимо без выхода за безопасную зону - "
                     f"используй баннер покрупнее."
                 )
+        anim = ""
+        if plan.get("content_fill", 1.0) < 0.95:
+            anim = (
+                f"\nГрафика анимирована: полностью развернутая видна на "
+                f"{plan['visible_area_ratio'] * 100:.0f}% экрана, в сжатых кадрах — меньше."
+            )
         await msg.edit_text("🚀 Загружаю результат...")
         await message.answer_video(
             video=FSInputFile(out_vid),
             caption=(
                 f"Готово ({label} · {platform_label} · {position_label})\n"
                 f"Баннер {bw}×{bh} — {plan['area_ratio'] * 100:.0f}% экрана"
+                + anim
                 + warn
             ),
         )
