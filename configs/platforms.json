@@ -1,5 +1,5 @@
 {
-  "_comment": "Safe zone в пикселях для кадра 1080x1920. Значения измерены по официальным шаблонам площадок. left/right/top/bottom - это полосы, которые перекрывает интерфейс. По вертикали баннер всегда рисуется внутри оставшегося safe box. По горизонтали бренд может разрешить выход за safe box через horizontal_bleed_ratio - тогда баннер выходит за safe box, но не больше разрешённого на сторону.",
+  "_comment": "Safe zone задаётся в пикселях для кадра 1080x1920. Сейчас все отступы нулевые: баннер идёт с хромакеем, зелёный фон срезается, и он просто лежит поверх ролика. Поэтому 'сверху/по центру/снизу' привязаны к краям кадра, а не к зоне без интерфейса площадки. Ненулевые отступы, если понадобится снова прятать баннер под интерфейс, задаются здесь: left/right/top/bottom - полосы, которые перекрывает интерфейс.",
   "_sources": {
     "tiktok": "ads.tiktok.com/help/article/tiktok-auction-in-feed-ads -> шаблон In-Feed/Feed.png (2880x5120), пересчёт x0.375",
     "insta": "Meta Ads Guide / Business Help 980593475366490 - 14% верх, 35% низ, 6% по бокам",
@@ -8,16 +8,16 @@
   "tiktok": {
     "title": "TikTok",
     "aspect": "9:16",
-    "inset": { "top": 240, "bottom": 660, "left": 120, "right": 120 }
+    "inset": { "top": 0, "bottom": 0, "left": 0, "right": 0 }
   },
   "insta": {
     "title": "Instagram Reels",
     "aspect": "9:16",
-    "inset": { "top": 269, "bottom": 672, "left": 65, "right": 65 }
+    "inset": { "top": 0, "bottom": 0, "left": 0, "right": 0 }
   },
   "shorts": {
     "title": "YouTube Shorts",
     "aspect": "9:16",
-    "inset": { "top": 288, "bottom": 672, "left": 48, "right": 192 }
+    "inset": { "top": 0, "bottom": 0, "left": 0, "right": 0 }
   }
 }

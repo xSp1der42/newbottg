@@ -29,23 +29,17 @@ PLATFORM_LABELS = {
     "shorts": "YouTube Shorts",
 }
 
-# Где может стоять баннер. "right" в списке нет намеренно: справа у TikTok,
-# Reels и Shorts живут кнопки интерфейса (лайк, коммент, репост), и баннер
-# под ними всё равно не читается. Внизу - подпись и кнопка звука, но наш
-# safe_box по площадкам там заканчивается выше, поэтому "bottom" в списке.
-POSITIONS = ("top", "center", "bottom", "left")
+# Где может стоять баннер: три положения по вертикали, все привязаны к краям
+# кадра. Боковых нет намеренно - узкая колонка не набирает площадь из ТЗ.
+# Прячем ли баннер под интерфейс площадки, решают insets в configs/platforms.json,
+# сейчас они нулевые.
+POSITIONS = ("top", "center", "bottom")
 POSITION_LABELS = {
     "top": "⬆️ Сверху",
     "center": "🎯 По центру",
     "bottom": "⬇️ Снизу",
-    "left": "⬅️ Слева",
 }
 DEFAULT_POSITION = "bottom"
-
-# При боковом размещении баннер занимает левую часть safe box, а не всю
-# ширину: иначе "слева" и "по центру" выглядели бы одинаково, а справа всё
-# равно осталась бы пустая половина под кнопки интерфейса.
-LEFT_COL_RATIO = 0.55
 
 # --- Обрезка хромакея по контенту -------------------------------------------
 # Кадр хромакеЙного баннера заметно больше того, что в нём видно: зелёный
@@ -75,11 +69,9 @@ CONTENT_FRAMES = 12
 CONTENT_CROP_MAX_FILL = 0.98
 
 # Горизонтальный вылет за safe box. Задаётся в конфиге бренда как
-# horizontal_bleed_ratio (доля ширины кадра на сторону). Вертикальный вылет
-# запрещён всегда: сверху заголовок, снизу подпись и кнопки - там интерфейс
-# перекрывает больше всего, и по вертикали safe box тонкий, но критичный.
-# Для широких баннеров (2.9:1) без вылета по бокам ТЗ по площади не
-# набирается в принципе, поэтому вылет - сознательный размен.
+# horizontal_bleed_ratio (доля ширины кадра на сторону). Сейчас insets нулевые,
+# поэтому вылет ничего не даёт и нужен только если вернуть отступы площадок.
+# Вертикальный вылет запрещён всегда - баннер не должен вылезать за кадр.
 
 # Потоки ffmpeg. По умолчанию 1: на хостинге с маленькой памятью (Render free
 # tier - 512 МБ) многопоточный x264 на вертикальном 1080x1920 упирается в OOM
@@ -430,7 +422,8 @@ def probe(path):
 
 def safe_box(platform, video_w, video_h):
     """Пересчитываем insets с 1080x1920 на фактический кадр и возвращаем
-    (x0, y0, x1, y1) - область, которую интерфейс НЕ перекрывает."""
+    (x0, y0, x1, y1) - область, в которую кладётся баннер. При нулевых
+    отступах это весь кадр, и тогда safe box совпадает с самим кадром."""
     cfg = load_platforms()[platform]
     ins = cfg["inset"]
     sx = video_w / REF_W
@@ -466,15 +459,11 @@ def resolve_position(config, position=None):
 def position_slot(x0, y0, x1, y1, position):
     """Прямоугольник, внутри которого центрируется баннер.
 
-    Для top/center/bottom это весь safe box - там сверху, снизу и по центру
-    интерфейс ничего не перекрывает. Для left берём левую колонку: баннер
-    прижимается к левому краю и центрируется по вертикали, а справа остаётся
-    пустое место под кнопки площадки. Справа (right) варианта нет намеренно.
+    Для всех позиций это весь safe box: там сверху, снизу и по центру
+    интерфейс ничего не перекрывает, и вертикаль задаётся отдельно в
+    plan_overlay. Боковых вариантов нет намеренно - узкая колонка не
+    набирает площадь из ТЗ (см. configs/platforms.json).
     """
-    box_w, box_h = x1 - x0, y1 - y0
-    if position == "left":
-        col_w = max(1, int(round(box_w * LEFT_COL_RATIO)))
-        return x0, y0, x0 + col_w, y1
     return x0, y0, x1, y1
 
 
@@ -523,10 +512,9 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, positio
     min_area_ratio = float(config.get("min_area_ratio", 0))
     min_area = min_area_ratio * video_w * video_h
 
-    # Потолок по ширине. В safe box баннер влезает не всегда: у баннера 2.9:1
-    # по бокам нужно 1016px ради 17% площади, а safe box шириной 840. По
-    # вертикали safe box не трогаем - там подпись, заголовок и кнопки.
-    bleed_ratio = 0.0 if position == "left" else float(config.get("horizontal_bleed_ratio", 0))
+    # Потолок по ширине: ширина safe box плюс разрешённый вылет по бокам.
+    # При нулевых insets это ровно video_w, и вылет ничего не добавляет.
+    bleed_ratio = float(config.get("horizontal_bleed_ratio", 0))
     bleed = int(round(bleed_ratio * video_w))
     max_w = even(min(video_w, slot_w + 2 * bleed))
 
@@ -570,11 +558,7 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, positio
     min_area_met = target_w * target_h >= min_area
     gap = int(round(slot_h * float(config.get("gap_ratio", 0.06))))
 
-    if position == "left":
-        # Прижимаем к левому краю зоны, вертикаль по центру: так справа от
-        # баннера остаётся максимум места под кнопки интерфейса.
-        pos_x = sx0
-    elif target_w <= slot_w:
+    if target_w <= slot_w:
         pos_x = sx0 + (slot_w - target_w) // 2
     else:
         # Баннер шире safe box - центрируем по кадру, иначе он уедет влево.
@@ -593,12 +577,12 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, positio
 
     if position == "top":
         pos_y = sy0 + gap
-    elif position in ("center", "left"):
+    elif position == "center":
         pos_y = sy0 + (slot_h - target_h) // 2
     else:  # bottom
         pos_y = sy1 - target_h - gap
 
-    # По вертикали держим safe box, по горизонтали - кадр (там разрешён вылет).
+    # Баннер не вылезает ни по вертикали, ни по горизонтали за кадр.
     pos_x = max(0, min(pos_x, video_w - target_w))
     pos_y = max(y0, min(pos_y, y1 - target_h))
 
@@ -614,9 +598,6 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, positio
         # Насколько контент растянули. Больше 1.5 - уже видно мыло: исходник
         # мелкий, и правильное решение - отдать баннер покрупнее.
         "upscale": round(target_w / src_w, 2) if src_w else 1.0,
-        # Позиция физически мешает набрать min_area_ratio: колонка уже, чем
-        # весь safe box. Бот предупредит мягче, чем при неудачных пропорциях.
-        "area_capped_by_position": position == "left" and not min_area_met,
         "area_ratio": round(area / (video_w * video_h), 4),
         # Сколько графики реально видно в самом крупном кадре анимации. Для
         # неподвижного баннера совпадает с area_ratio, для анимированного

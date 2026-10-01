@@ -1,5 +1,6 @@
 import os
 import asyncio
+import threading
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -77,8 +78,8 @@ def brand_button_text(brand: str, platform: str | None = None) -> str:
 
 
 POSITION_HINT = (
-    "<i>Справа варианта нет: там кнопки интерфейса площадки — "
-    "лайк, коммент, репост. Баннер под ними всё равно не читается.</i>"
+    "<i>Баннер идёт с хромакеем, зелёный фон срезается, и графика ложится "
+    "поверх ролика. Позиция привязана к краю кадра.</i>"
 )
 
 
@@ -200,22 +201,12 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
                          f"когда она развернулась полностью, и меньше, когда сжата")
 
     if plan and not plan["min_area_met"]:
-        if plan.get("area_capped_by_position"):
-            lines += [
-                "",
-                f"⚠️ <i>Слева баннер занимает {plan['area_ratio'] * 100:.0f}% экрана, "
-                f"а ТЗ требует {plan['min_area_ratio'] * 100:.0f}%. Слева для этого мало "
-                f"места — баннер упёрся в безопасную зону, дальше растягивать нельзя. "
-                f"Рендер пойдёт, но площадь недобор: если важен размер, бери "
-                f"«Снизу» или «По центру».</i>",
-            ]
-        else:
-            lines += [
-                "",
-                f"⚠️ <i>Баннер займёт {plan['area_ratio'] * 100:.0f}% экрана, "
-                f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}% — пропорции баннера "
-                f"слишком вытянутые. Рендер всё равно пойдёт, но площадь недобор.</i>",
-            ]
+        lines += [
+            "",
+            f"⚠️ <i>Баннер займёт {plan['area_ratio'] * 100:.0f}% экрана, "
+            f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}% — пропорции баннера "
+            f"слишком вытянутые. Рендер всё равно пойдёт, но площадь недобор.</i>",
+        ]
 
     await message.edit_text("\n".join(lines), parse_mode="HTML")
 
@@ -418,20 +409,12 @@ async def process_video(message: Message, state: FSMContext):
         bw, bh = plan["size"]
         warn = ""
         if not plan["min_area_met"]:
-            if plan.get("area_capped_by_position"):
-                warn = (
-                    f"\n⚠️ Баннер занимает {plan['area_ratio'] * 100:.1f}% экрана, "
-                    f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}%. Слева для этого "
-                    f"физически не хватает места в безопасной зоне — рендер прошёл, "
-                    f"но площадь недобор."
-                )
-            else:
-                warn = (
-                    f"\n⚠️ Баннер занимает {plan['area_ratio'] * 100:.1f}% экрана, "
-                    f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}%. При таких пропорциях "
-                    f"баннера это физически недостижимо без выхода за безопасную зону - "
-                    f"используй баннер покрупнее."
-                )
+            warn = (
+                f"\n⚠️ Баннер занимает {plan['area_ratio'] * 100:.1f}% экрана, "
+                f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}%. При таких пропорциях "
+                f"баннера это физически недостижимо без выхода за безопасную зону - "
+                f"используй баннер покрупнее."
+            )
         anim = ""
         if plan.get("content_fill", 1.0) < 0.95:
             anim = (
@@ -469,7 +452,52 @@ async def process_video(message: Message, state: FSMContext):
     await message.answer("Ещё ролик?", reply_markup=get_platforms_keyboard())
 
 
+def start_health_server(port: int) -> bool:
+    """Поднимаем минимальный HTTP-ответчик, чтобы процесс держал порт.
+
+    Render запускает сервис как web service и после старта сканирует порты.
+    Бот работает на long polling и сам по себе не слушает ничего, поэтому деплой
+    доходил до "No open ports detected" и помечался как неудачный, хотя бот к
+    этому моменту уже работал.
+
+    Заодно это готовая точка для внешнего мониторинга: на фри-хостинге инстанс
+    засыпает после простоя, и периодический пинг по /healthz его будит.
+
+    Порт берём из PORT - Render задаёт его сам, локально можно задать руками.
+    """
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self):
+            body = b"ok\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, fmt, *args):
+            # Пинг мониторинга не должен сыпать лог рендера.
+            pass
+
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    except OSError as e:
+        # Бот должен работать и без health-сервера: это подсказка, а не причина
+        # не подниматься. Если порт занят - предупреждаем и едем дальше.
+        print(f"[WARN] порт {port} занят, health-сервер не поднят: {e}")
+        return False
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"Health-сервер слушает порт {port} (/healthz)")
+    return True
+
+
 async def main():
+    port = int(os.getenv("PORT") or 8000)
+    await asyncio.to_thread(start_health_server, port)
+
     brands = render.list_brands()
     platforms = render.list_platforms()
     print(f"Бот запущен. Платформы: {platforms}")
