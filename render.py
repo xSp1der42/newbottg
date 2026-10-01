@@ -1,5 +1,6 @@
 import json
 import subprocess
+import tempfile
 from pathlib import Path
 
 BASE = Path(__file__).resolve().parent
@@ -39,10 +40,25 @@ FFMPEG_THREADS = 1
 # кадра. Замеры на этой машине (ffmpeg + колорокей + overlay, вертикаль):
 #   1080x1920 @60fps, баннер 2000x1920 -> пик 362 МБ
 #   1080x1920 @60fps, баннер 1440x600  -> пик 231 МБ
-#   2160x3840 @30fps, баннер 2000x1920 -> пик 733 МБ  <-- Render убивает
-# У Render free tier 512 МБ, поэтому 4K-исходник кодировать нельзя. Любой
-# вертикальный ролик принимаем, но на выход всегда идёт не выше MAX_OUT_*.
+#   1440x2560 @60fps одним проходом     -> пик 488 МБ (впритык к 512)
+#   1440x2560 @60fps двумя проходами    -> пик 242 + 393 МБ
+# У Render free tier 512 МБ, поэтому крупный кадр проходит через
+# build_prepass_cmd(), а на выход всегда идёт не выше MAX_OUT_*.
 MAX_OUT_W, MAX_OUT_H = 1080, 1920
+
+# Потолок входа. Всё между MAX_OUT_* и этим лимитом бот ужимает сам,
+# отдельным проходом (см. build_prepass_cmd).
+#
+# Граница задана по ПЛОЩАДИ кадра, а не по отдельным сторонам: память под
+# декодирование растёт с числом пикселей, а не с длиной стороны. Замеры
+# препрохода + наложения (insta, худшая площадка, 59с):
+#   1170x2532 = 2.96 Мп -> 344 МБ   (iPhone 11/12/13)
+#   1284x2778 = 3.57 Мп -> 373 МБ   (iPhone Pro Max)
+#   1440x2560 = 3.69 Мп -> 396 МБ
+#   2160x3840 = 8.29 Мп -> 447 МБ на одном препроходе (запас 13%)
+# 4 Мп - последняя точка, где запас ещё рабочий; 8 Мп оставляют 13% и
+# того рискованнее.
+MAX_IN_PIXELS = 4_000_000
 
 
 def load_platforms():
@@ -363,8 +379,8 @@ def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma,
         # колорокей и наложение работают уже с 1080x1920 и не держат в памяти
         # четыре мегапикселя на каждый буферизованный кадр.
         chains.append(
-            f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
-            f"setsar=1[src]"
+            f"[0:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:"
+            f"force_divisible_by=2,setsar=1[src]"
         )
         vsrc = "src"
     else:
@@ -443,10 +459,47 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     return cmd, plan
 
 
-def render(input_vid, banner_vid, out_vid, platform, brand):
-    _, _, duration = probe(input_vid)
-    cmd, plan = build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration)
+def build_prepass_cmd(input_vid, out_vid, duration=0):
+    """Проход ужатия: только декод исходника и scale, без баннера.
 
+    Нужен для кадров выше MAX_OUT_*. Один ffmpeg с наложением на большом
+    исходнике держит в памяти и декодированные кадры, и буферы колоркея с
+    overlay одновременно. Замеры на 1440x2560 + insta (59с):
+      один проход  -> 488 МБ (запас 5%, Render считал это OOM)
+      два прохода  -> 242 МБ тут и 393 МБ тут (запас 23%)
+    Разносим по разным процессам, и тяжёлые буферы не накладываются.
+    """
+    out_w, out_h = out_size(*probe(input_vid)[:2])
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(input_vid),
+        # force_divisible_by обязателен: scale с force_original_aspect_ratio
+        # сам округляет вторую сторону, и для нестандартных кадров iPhone
+        # (1170x2532, 1260x2720, 1284x2778) получалась нечётная высота,
+        # которую yuv420p отвергает с кодом -22.
+        "-vf", f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease:"
+               f"force_divisible_by=2,setsar=1",
+        "-threads", str(FFMPEG_THREADS),
+        "-filter_threads", "1",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "26",
+        "-maxrate", "2500k",
+        "-bufsize", "500k",
+        "-pix_fmt", "yuv420p",
+        "-profile:v", "main",
+        "-level", "4.1",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ac", "1",
+        "-ar", "44100",
+    ]
+    if duration > 0:
+        cmd += ["-t", f"{duration:.3f}"]
+    cmd += [str(out_vid)]
+    return cmd
+
+
+def _run_ffmpeg(cmd):
     # subprocess.run сам вычитывает stderr в фоне, поэтому ffmpeg не встанет
     # на записи в полный канал. В PIPE оставляем только ошибки - прогресс
     # отключён флагами выше.
@@ -454,4 +507,25 @@ def render(input_vid, banner_vid, out_vid, platform, brand):
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or "").strip().splitlines()[-12:])
         raise RuntimeError(f"ffmpeg упал (код {proc.returncode}):\n{tail}")
+
+
+def render(input_vid, banner_vid, out_vid, platform, brand):
+    src_w, src_h, duration = probe(input_vid)
+
+    # Крупный кадр ужимаем отдельным проходом: колорокей и overlay поверх
+    # 2160x3840 в одном процессе не помещаются в 512 МБ Render.
+    if src_w > MAX_OUT_W or src_h > MAX_OUT_H:
+        with tempfile.TemporaryDirectory(prefix="prepass_") as tmp:
+            mid = Path(tmp) / "mid.mp4"
+            _run_ffmpeg(build_prepass_cmd(input_vid, mid, duration))
+            cmd, plan = build_ffmpeg_cmd(mid, banner_vid, out_vid, platform, brand, duration)
+            # Плану показываем исходник, а не промежуточный файл.
+            plan["src_size"] = (src_w, src_h)
+            plan["prepassed"] = True
+            _run_ffmpeg(cmd)
+        return plan
+
+    cmd, plan = build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration)
+    plan["prepassed"] = False
+    _run_ffmpeg(cmd)
     return plan

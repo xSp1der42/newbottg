@@ -232,18 +232,19 @@ async def process_video(message: Message, state: FSMContext):
             parse_mode="HTML",
         )
 
-    # 4K не декодируется в 512 МБ: замеры показали 534 МБ на голом декоде
-    # 2160x3840 и ~660 МБ с колоркеем и наложением, поэтому Render убивал
-    # контейнер с OOM. Ролик выше 1080x1920 просим пережать ДО отправки,
-    # а не убиваем им сервер.
-    if (message.video.width or 0) > render.MAX_OUT_W or (message.video.height or 0) > render.MAX_OUT_H:
+    # Кадр крупнее 4 Мп отклоняем: ужатие идёт отдельным проходом, и на 4K
+    # он сам по себе ест 446 МБ из 512 - запас в 13%. Всё, что меньше,
+    # бот ужимает сам, включая 1440x2560 и любые iPhone-разрешения.
+    vw_in = message.video.width or 0
+    vh_in = message.video.height or 0
+    if vw_in * vh_in > render.MAX_IN_PIXELS:
         return await message.answer(
-            f"❌ Слишком большое разрешение: <b>{message.video.width}×{message.video.height}</b>.\n\n"
-            f"Рендер идёт на {render.MAX_OUT_W}×{render.MAX_OUT_H} (это 9:16), "
-            f"а 4K на хостинге не декодируется — память кончается и бот падает.\n\n"
+            f"❌ Слишком большое разрешение: <b>{vw_in}×{vh_in}</b>.\n\n"
+            f"Бот сам ужмёт ролик до {render.MAX_OUT_W}×{render.MAX_OUT_H}, "
+            f"но на хостинге помещается кадр не крупнее 4 Мп — "
+            f"на {vw_in * vh_in / 1_000_000:.1f} Мп памяти не хватит.\n\n"
             f"📱 Как пережать на телефоне: открой ролик → <b>Поделиться</b> → "
-            f"<b>Сохранить видео</b> — iPhone сам отдаст 1080p. "
-            f"Либо в настройках камеры снимай в 1080p, а не 4K.",
+            f"<b>Сохранить видео</b> — iPhone сам отдаёт 1080p.",
             parse_mode="HTML",
         )
 
