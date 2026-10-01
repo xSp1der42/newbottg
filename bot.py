@@ -121,7 +121,11 @@ async def process_platform(callback: CallbackQuery, state: FSMContext):
     await state.set_state(VideoState.chosen_brand)
     label = render.PLATFORM_LABELS.get(platform, platform.upper())
     await callback.message.edit_text(
-        f"📱 Формат: <b>{label}</b>\nВыбери бренд:", reply_markup=get_brands_keyboard(), parse_mode="HTML"
+        f"✅ Формат: <b>{label}</b>\n\n"
+        f"Ролик должен быть <b>вертикальным</b> (9:16, обычно 1080×1920).\n"
+        f"Теперь выбери бренд:",
+        reply_markup=get_brands_keyboard(platform=platform),
+        parse_mode="HTML",
     )
 
 
@@ -139,26 +143,61 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
     await state.update_data(chosen_brand=brand)
     await state.set_state(VideoState.waiting_for_video)
 
+    data = await state.get_data()
+    platform = data.get("chosen_platform")
+
     label = render.BRAND_LABELS.get(brand, config.get("title", brand))
-    rules = []
-    if config.get("chroma_key"):
-        rules.append("🟢 <i>Хромакей: бот сам вырежет фон из баннера.</i>")
-    rules.append(f"📏 <i>Ширина: {int(config.get('width_ratio', 0.8) * 100)}% безопасной зоны, зациклен на всё видео.</i>")
+    platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
 
     per_platform = config.get("media_by_platform") or {}
     expected = per_platform.get(platform) or config.get("media") or "banner.mp4"
-    if not render.find_banner(brand, config, platform=platform):
-        rules.append(
-            f"\n🚨 <b>НЕТ ФАЙЛА БАННЕРА</b> — положи <code>{expected}</code> "
-            f"в папку <code>banners/{brand}/</code> на сервере."
-        )
-    elif expected in per_platform:
-        rules.append(f"\n🎬 <i>Баннер: <code>{expected}</code></i>")
+    banner_path = render.find_banner(brand, config, platform=platform)
 
-    await callback.message.edit_text(
-        f"✅ Готов делать <b>{label}</b>! Кидай видео (до {MAX_DURATION} сек).\n" + "\n".join(rules),
-        parse_mode="HTML",
-    )
+    if not banner_path:
+        return await callback.message.edit_text(
+            f"❌ <b>Баннер не найден на сервере</b>\n\n"
+            f"Формат: <b>{platform_label}</b>\n"
+            f"Бренд: <b>{label}</b>\n\n"
+            f"Ожидается <code>banners/{brand}/{expected}</code> — "
+            f"а такого файла нет. Напиши разработчику, поправим.",
+            parse_mode="HTML",
+        )
+
+    # Считаем раскладку заранее, чтобы предупредить про площадь сразу,
+    # а не через 3 минуты ожидания рендера.
+    plan = None
+    try:
+        plan = render.plan_banner(platform, banner_path, config)
+    except Exception:
+        pass
+
+    bw, bh = plan["size"] if plan else (0, 0)
+    lines = [
+        "🟢 <b>Готово. Теперь скинь видео.</b>",
+        "",
+        f"Формат: <b>{platform_label}</b>",
+        f"Бренд: <b>{label}</b>",
+        f"Баннер: <code>{banner_path.name}</code>",
+        "",
+        "📎 <b>Прикрепи ролик файлом</b> или запиши кружочек — "
+        "дальше всё сделает бот сам.",
+        "",
+        "<i>Требования к ролику:</i>",
+        f"• вертикальный, 9:16 (1080×1920)",
+        f"• до {MAX_DURATION} секунд",
+    ]
+    if plan:
+        lines.append(f"• баннер ляжет в безопасную зону, {bw}×{bh}")
+
+    if plan and not plan["min_area_met"]:
+        lines += [
+            "",
+            f"⚠️ <i>Баннер займёт {plan['area_ratio'] * 100:.0f}% экрана, "
+            f"ТЗ требует {plan['min_area_ratio'] * 100:.0f}% — пропорции баннера "
+            f"слишком вытянутые. Рендер всё равно пойдёт, но площадь недобор.</i>",
+        ]
+
+    await callback.message.edit_text("\n".join(lines), parse_mode="HTML")
 
 
 @dp.message(VideoState.waiting_for_video, F.video)
@@ -177,6 +216,17 @@ async def process_video(message: Message, state: FSMContext):
 
     config = render.load_brand(brand)
     banner_path = render.find_banner(brand, config, platform=platform)
+
+    # Отсекаем горизонтальные ролики: safe zones заданы под вертикальный 9:16,
+    # на альбомном кадре баннер уедет в неправильное место.
+    if message.video.width and message.video.height and message.video.height <= message.video.width:
+        return await message.answer(
+            f"❌ Это <b>горизонтальное</b> видео ({message.video.width}×{message.video.height}).\n\n"
+            f"Нужен вертикальный ролик 9:16 — обычно 1080×1920. "
+            f"Возьми исходник вертикальной съёмки, а не обрезанный/повёрнутый ролик из ленты.",
+            parse_mode="HTML",
+        )
+
     if not banner_path:
         expected = (config.get("media_by_platform") or {}).get(platform) \
             or config.get("media") or "banner.mp4"
@@ -187,7 +237,11 @@ async def process_video(message: Message, state: FSMContext):
         )
 
     label = render.BRAND_LABELS.get(brand, brand.upper())
-    msg = await message.answer(f"⏳ Рендер <b>{label}</b> на {platform.upper()}...")
+    platform_label = render.PLATFORM_LABELS.get(platform, platform.upper())
+    msg = await message.answer(
+        f"⏳ Скачиваю ролик и рендерю <b>{label}</b> на {platform_label}...",
+        parse_mode="HTML",
+    )
 
     file_id = message.video.file_id
     in_vid = BASE / "videos" / f"in_{file_id}.mp4"
@@ -197,7 +251,30 @@ async def process_video(message: Message, state: FSMContext):
         tg_file = await bot.get_file(file_id)
         await bot.download_file(tg_file.file_path, destination=in_vid)
 
-        plan = await asyncio.to_thread(render.render, in_vid, banner_path, out_vid, platform, brand)
+        vw, vh, _ = render.probe(in_vid)
+        platform_label = render.PLATFORM_LABELS.get(platform, platform.upper())
+
+        async def keep_alive():
+            """Пока ffmpeg жуёт CPU в отдельном потоке, трогаем сообщение:
+            так юзер видит, что бот жив, а не завис намертво."""
+            started = asyncio.get_running_loop().time()
+            while True:
+                await asyncio.sleep(20)
+                spent = int(asyncio.get_running_loop().time() - started)
+                try:
+                    await msg.edit_text(
+                        f"⏳ <b>Рендер идёт</b> · {label} · {platform_label}\n"
+                        f"<i>Кадр {vw}×{vh}, прошло {spent} сек. "
+                        f"Рендер идёт в один поток — это медленно, но стабильно.</i>"
+                    )
+                except Exception:
+                    pass
+
+        ticker = asyncio.create_task(keep_alive())
+        try:
+            plan = await asyncio.to_thread(render.render, in_vid, banner_path, out_vid, platform, brand)
+        finally:
+            ticker.cancel()
 
         pos_x, pos_y = plan["pos"]
         bw, bh = plan["size"]
@@ -213,13 +290,18 @@ async def process_video(message: Message, state: FSMContext):
         await message.answer_video(
             video=FSInputFile(out_vid),
             caption=(
-                f"Трафик готов! ({label} · {platform.upper()})\n"
-                f"Баннер {bw}×{bh} @ ({pos_x},{pos_y}) — {plan['area_ratio'] * 100:.1f}% экрана"
+                f"Готово ({label} · {platform_label})\n"
+                f"Баннер {bw}×{bh} — {plan['area_ratio'] * 100:.0f}% экрана"
                 + warn
             ),
         )
     except Exception as e:
-        await message.answer("❌ Ошибка обработки. Подробности в логе сервера.")
+        await message.answer(
+            f"❌ <b>Не получилось сделать ролик.</b>\n\n"
+            f"Причина на сервере: <code>{type(e).__name__}</code>\n"
+            f"Если это повторяется — скинь это сообщение разработчику.",
+            parse_mode="HTML",
+        )
         print(f"[ERROR] {type(e).__name__}: {e}")
     finally:
         for p in (in_vid, out_vid):
@@ -231,7 +313,7 @@ async def process_video(message: Message, state: FSMContext):
             pass
 
     await state.clear()
-    await message.answer("Ещё?", reply_markup=get_platforms_keyboard())
+    await message.answer("Ещё ролик?", reply_markup=get_platforms_keyboard())
 
 
 async def main():

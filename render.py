@@ -29,6 +29,12 @@ PLATFORM_LABELS = {
     "shorts": "YouTube Shorts",
 }
 
+# Потоки ffmpeg. По умолчанию 1: на хостинге с маленькой памятью (Render free
+# tier - 512 МБ) многопоточный x264 на вертикальном 1080x1920 упирается в OOM
+# и контейнер перезапускается на середине рендера. Подними до 2+, если памяти
+# хватает - рендер станет заметно быстрее.
+FFMPEG_THREADS = 1
+
 
 def load_platforms():
     with open(PLATFORMS_FILE, encoding="utf-8") as f:
@@ -298,6 +304,20 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config):
     }
 
 
+def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H):
+    """Считает план раскладки баннера, ничего не рендеря.
+
+    Нужно, чтобы показать пользователю размер и предупредить про площадь
+    ДО того, как он отправит видео в рендер на пару минут.
+    """
+    banner_path = Path(banner_path)
+    banner_w, banner_h, _ = probe(banner_path)
+
+    plan = plan_overlay(platform, video_w, video_h, banner_w, banner_h, config)
+    plan["banner_size"] = (banner_w, banner_h)
+    return plan
+
+
 def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma, duration):
     plan = plan_overlay(platform, video_w, video_h, banner_w, banner_h, config)
     pos_x, pos_y = plan["pos"]
@@ -338,13 +358,31 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     filters, plan = build_filter(platform, vw, vh, bw, bh, config, chroma, duration)
     plan["chroma"] = chroma
 
+    # Экономим память: Render free tier даёт 512 МБ, и x264 на вертикальном
+    # 1080x1920 с несколькими потоками выедает память и контейнер падает
+    # с OOM прямо посреди рендера (пользователь видит "⏳ Рендер..." и вечность).
+    # Один поток + ultrafast + узкий bufsize удерживают пик в рамках.
     cmd += [
         "-filter_complex", filters,
         "-map", "[outv]",
         "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+        "-threads", str(FFMPEG_THREADS),
+        "-filter_threads", "1",
+        "-filter_complex_threads", "1",
+        "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-crf", "26",
+        "-maxrate", "2500k",
+        "-bufsize", "500k",
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k",
+        # 1080x1920 = 8160 макроблоков. level 3.1 держит только 3600, поэтому
+        # для вертикальных роликов нужен 4.1 - иначе x264 ругается на размер кадра.
+        "-profile:v", "main",
+        "-level", "4.1",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ac", "1",
+        "-ar", "44100",
         "-movflags", "+faststart",
     ]
     if duration > 0:
