@@ -1,0 +1,21 @@
+{
+  "brand": "playerok",
+  "title": "Playerok",
+  "media": "banner.mov",
+  "chroma_key": {
+    "color": "auto",
+    "similarity": 0.06,
+    "blend": 0.02
+  },
+  "width_ratio": 0.85,
+  "anchor": "bottom",
+  "gap_ratio": 0.06,
+  "min_area_ratio": 0.1667,
+  "loop": "stream_loop",
+  "notes": "Хромакей: зелёный фон вырезается. Баннер должен остаться непрозрачным и не размытым - similarity/smoothness не завышать.",
+  "media_by_platform": {
+    "tiktok": "tiktok.mp4",
+    "insta": "insta.mp4",
+    "shorts": "shorts.mp4"
+  }
+}

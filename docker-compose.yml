@@ -1,0 +1,13 @@
+services:
+  bot:
+    build: .
+    container_name: tgbotvideos
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Баннеры и конфиги прокидываем наружу, чтобы не пересобирать образ
+      # после замены mp4 или правки настроек.
+      - ./banners:/app/banners
+      - ./configs:/app/configs
+      - ./videos:/app/videos

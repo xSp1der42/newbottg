@@ -1,0 +1,12 @@
+{
+  "brand": "mostbet",
+  "title": "Mostbet",
+  "media": "banner.png",
+  "chroma_key": null,
+  "width_ratio": 0.80,
+  "anchor": "bottom",
+  "gap_ratio": 0.06,
+  "min_area_ratio": 0.1667,
+  "loop": "eof_action",
+  "notes": "Стандартное правило: 80% ширины safe box, нижний край с отступом от интерфейса. Пропорции оригинального баннера сохраняются."
+}

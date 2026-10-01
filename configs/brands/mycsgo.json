@@ -1,0 +1,12 @@
+{
+  "brand": "mycsgo",
+  "title": "MyCSGO",
+  "media": "banner.png",
+  "chroma_key": null,
+  "width_ratio": 0.80,
+  "anchor": "bottom",
+  "gap_ratio": 0.06,
+  "min_area_ratio": 0.1667,
+  "loop": "eof_action",
+  "notes": "Стандартное правило. ВНИМАНИЕ: сайт mycsgo.com не отвечает и не архивируется с 2018 года - проверь, что бренд ещё работает, прежде чем лить на него трафик."
+}

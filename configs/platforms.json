@@ -1,0 +1,23 @@
+{
+  "_comment": "Safe zone в пикселях для кадра 1080x1920. Значения измерены по официальным шаблонам площадок. left/right/top/bottom - это полосы, которые перекрывает интерфейс. Баннер всегда рисуется внутри оставшегося safe box.",
+  "_sources": {
+    "tiktok": "ads.tiktok.com/help/article/tiktok-auction-in-feed-ads -> шаблон In-Feed/Feed.png (2880x5120), пересчёт x0.375",
+    "insta": "Meta Ads Guide / Business Help 980593475366490 - 14% верх, 35% низ, 6% по бокам",
+    "shorts": "services.google.com/fh/files/misc/youtubesafezoneoverlay_vertical_final.png (1080x1920)"
+  },
+  "tiktok": {
+    "title": "TikTok",
+    "aspect": "9:16",
+    "inset": { "top": 240, "bottom": 660, "left": 120, "right": 120 }
+  },
+  "insta": {
+    "title": "Instagram Reels",
+    "aspect": "9:16",
+    "inset": { "top": 269, "bottom": 672, "left": 65, "right": 65 }
+  },
+  "shorts": {
+    "title": "YouTube Shorts",
+    "aspect": "9:16",
+    "inset": { "top": 288, "bottom": 672, "left": 48, "right": 192 }
+  }
+}

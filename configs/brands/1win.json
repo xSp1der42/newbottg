@@ -1,0 +1,12 @@
+{
+  "brand": "1win",
+  "title": "1Win",
+  "media": "banner.png",
+  "chroma_key": null,
+  "width_ratio": 0.80,
+  "anchor": "bottom",
+  "gap_ratio": 0.06,
+  "min_area_ratio": 0.1667,
+  "loop": "eof_action",
+  "notes": "Стандартное правило, как у Mostbet. Дисклеймер 18+ по требованию TikTok рекламной политики на gambling - наносится поверх, если нужен."
+}

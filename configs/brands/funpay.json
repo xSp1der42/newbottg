@@ -1,0 +1,12 @@
+{
+  "brand": "funpay",
+  "title": "FunPay",
+  "media": "banner.png",
+  "chroma_key": null,
+  "width_ratio": 1.0,
+  "anchor": "bottom",
+  "gap_ratio": 0.04,
+  "min_area_ratio": 0.1667,
+  "loop": "eof_action",
+  "notes": "ТЗ Фанпея: 90-100% ширины экрана. Ставится на всю ширину safe box, то есть 90-100% ширины кадра с учётом слепых зон."
+}
