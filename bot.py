@@ -1,15 +1,9 @@
 import os
 import html
-import re
-import socket
 import asyncio
-import hashlib
-import ipaddress
 import threading
 from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
 
-import aiohttp
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
@@ -40,18 +34,6 @@ MAX_DURATION = 59
 # проверяем заранее и говорим юзеру понятную причину, а не сырой TelegramBadRequest.
 TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
 TG_UPLOAD_LIMIT = 50 * 1024 * 1024
-
-# Приём ролика по ссылке. Нужен потому, что 20 МБ - это потолок Telegram, и
-# файл крупнее бот в чат не получит никак. По URL он качает сам, и там
-# ограничение только наш: диск и память хостинга.
-LINK_DOWNLOAD_LIMIT = 512 * 1024 * 1024
-LINK_CHUNK = 1 << 20
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-)
-GDRIVE_API = "https://drive.usercontent.google.com/download"
-YANDEX_API = "https://cloud-api.yandex.net/v1/disk/public/resources/download"
 
 # Рендер ОДИН за раз. Замеры: ролик 1080x1920@60 на insta ест 415 МБ из 512 МБ
 # контейнера. Два параллельных ffmpeg - это 800 МБ, и Render убьёт контейнер
@@ -274,9 +256,9 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
         "📎 <b>Прикрепи ролик файлом</b> или запиши кружочек — "
         "дальше всё сделает бот сам.",
         "",
-        "🔗 <b>Ролик крупнее 20 МБ — пришли ссылкой</b>, и я скачаю его сам: "
-        "прямая ссылка на видео, Google Drive или Яндекс.Диск. Файл в Telegram "
-        "больше 20 МБ бот не получает в принципе.",
+        "⚠️ <b>Файл крупнее 20 МБ бот не получит</b> — это потолок Telegram, "
+        "а не бота. Пережми ролик на телефоне: открой → <b>Поделиться</b> → "
+        "<b>Сохранить видео</b>, обычно выходит 1080p и меньше 20 МБ.",
         "",
         "<i>Требования к ролику:</i>",
         "• вертикальный, 9:16 (лучше всего 1080×1920)",
@@ -465,208 +447,6 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
     return await finish_setup(callback.message, state, platform, brand)
 
 
-class LinkError(Exception):
-    """Ошибка скачивания по ссылке. Текст можно показывать юзеру как есть."""
-
-
-# Бот качает то, что прислал юзер, поэтому запросы во внутреннюю сеть хоста
-# закрываем: иначе ссылкой вида http://127.0.0.1:PORT можно было бы стянуть
-# метаданные Render или залезть в соседний контейнер.
-PRIVATE_NETS = tuple(ipaddress.ip_network(n) for n in (
-    "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
-    "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
-    "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4", "::1/128",
-    "fc00::/7", "fe80::/10",
-))
-
-
-def _is_public(addr: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(addr)
-    except ValueError:
-        return False
-    return not any(ip in net for net in PRIVATE_NETS)
-
-
-class PublicOnlyResolver(aiohttp.abc.AbstractResolver):
-    """Резолвер aiohttp, отбрасывающий непубличные адреса.
-
-    Проверка именно на этапе resolve, а не до запроса: иначе один и тот же домен
-    может снаружи отдавать публичный IP, а боту внутри - 127.0.0.1.
-    """
-
-    def __init__(self):
-        self._base = aiohttp.resolver.DefaultResolver()
-
-    async def resolve(self, host, port=0, family=socket.AF_INET):
-        infos = await self._base.resolve(host, port, family)
-        for info in infos:
-            if not _is_public(info["host"]):
-                raise LinkError(
-                    f"Ссылка ведёт на внутренний адрес ({info['host']}). "
-                    f"Бот качает только из открытого интернета."
-                )
-        return infos
-
-    async def close(self):
-        await self._base.close()
-
-
-URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-
-
-def extract_url(text: str) -> str | None:
-    """Достаёт первый http(s)-адрес из текста. Хвостовую пунктуацию отрезаем:
-    иначе ссылка, законченная точкой или скобкой, не откроется."""
-    m = URL_RE.search(text or "")
-    return m.group(0).rstrip('.,;:!?)]}>"\'') if m else None
-
-
-async def _pump(resp, dest: Path, progress=None) -> int:
-    """Сливает открытый HTTP-ответ в файл, упираясь в LINK_DOWNLOAD_LIMIT."""
-    if resp.status >= 400:
-        raise LinkError(
-            f"Сервер ответил {resp.status}. Проверь, что ссылка живая и файл открыт."
-        )
-    if "text/html" in (resp.headers.get("Content-Type") or "").lower():
-        raise LinkError(
-            "По ссылке пришла веб-страница, а не файл. Нужен адрес, который сразу "
-            "отдаёт видео, или публичная ссылка на облако."
-        )
-    total = int(resp.headers.get("Content-Length") or 0) or None
-    if total and total > LINK_DOWNLOAD_LIMIT:
-        raise LinkError(
-            f"Файл {total / 1024 / 1024:.0f} МБ, а бот берёт не больше "
-            f"{LINK_DOWNLOAD_LIMIT // 1024 // 1024} МБ."
-        )
-
-    written = 0
-    last = 0.0
-    loop = asyncio.get_running_loop()
-    with dest.open("wb") as f:
-        async for chunk in resp.content.iter_chunked(LINK_CHUNK):
-            written += len(chunk)
-            if written > LINK_DOWNLOAD_LIMIT:
-                raise LinkError(
-                    f"Файл перевалил за {LINK_DOWNLOAD_LIMIT // 1024 // 1024} МБ - "
-                    f"скачивание прервано."
-                )
-            f.write(chunk)
-            if progress and loop.time() - last >= 4:
-                last = loop.time()
-                await progress(written, total)
-    if not written:
-        raise LinkError("Файл пустой - по ссылке нечего сохранять.")
-    return written
-
-
-def _gdrive_file_id(url: str) -> str | None:
-    parsed = urlparse(url)
-    if "/file/d/" in parsed.path:
-        return parsed.path.split("/file/d/", 1)[1].split("/")[0]
-    found = parse_qs(parsed.query)
-    for key in ("id", "usg"):
-        if found.get(key):
-            return found[key][0]
-    return None
-
-
-def _parse_gdrive_confirm(page: str):
-    """Google на файлах крупнее ~100 МБ отдаёт HTML-прослойку с формой вместо
-    видео. Достаём action и скрытые поля, чтобы повторить запрос от неё."""
-    m = re.search(r'<form[^>]+action="([^"]+)"', page)
-    if not m:
-        return None
-    action = urljoin(GDRIVE_API, m.group(1).replace("&amp;", "&"))
-    fields = {
-        name: value.replace("&amp;", "&")
-        for name, value in re.findall(
-            r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', page
-        )
-    }
-    return action, fields
-
-
-async def _download_gdrive(session, url, dest, progress):
-    file_id = _gdrive_file_id(url)
-    if not file_id:
-        raise LinkError(
-            "Не разобрал ссылку Google Drive. Пришли адрес вида "
-            "https://drive.google.com/file/d/.../view"
-        )
-    params = {"id": file_id, "export": "download", "confirm": "t"}
-    action = fields = None
-    async with session.get(GDRIVE_API, params=params) as resp:
-        if "text/html" in (resp.headers.get("Content-Type") or "").lower():
-            form = _parse_gdrive_confirm(await resp.text())
-            if not form:
-                raise LinkError(
-                    "Google Drive не отдал файл. Открой доступ «Все, у кого есть "
-                    "ссылка» и убедись, что файл не удалён."
-                )
-            action, fields = form
-    if action:
-        async with session.get(action, params=fields) as resp:
-            return await _pump(resp, dest, progress)
-    async with session.get(GDRIVE_API, params=params) as resp:
-        return await _pump(resp, dest, progress)
-
-
-async def _download_yandex(session, url, dest, progress):
-    async with session.get(YANDEX_API, params={"public_key": url}) as resp:
-        if resp.status != 200:
-            try:
-                detail = (await resp.json(content_type=None)).get("message", "")
-            except Exception:
-                detail = ""
-            raise LinkError(
-                "Яндекс.Диск не отдал файл. Проверь, что доступ по ссылке открыт "
-                "и ссылка не истёкла." + (f" Ответ: {detail}" if detail else "")
-            )
-        payload = await resp.json(content_type=None)
-    href = payload.get("href")
-    if not href:
-        raise LinkError(
-            "Яндекс.Диск не вернул ссылку на скачивание - по этой ссылке файл "
-            "недоступен."
-        )
-    async with session.get(href) as resp:
-        return await _pump(resp, dest, progress)
-
-
-async def download_by_url(url: str, dest: Path, progress=None) -> int:
-    """Качает видео по ссылке в dest. Понимает три вида ссылок: прямую на файл,
-    Google Drive и публичный Яндекс.Диск."""
-    host = (urlparse(url).hostname or "").strip("[]")
-    if not host:
-        raise LinkError("В ссылке нет адреса.")
-    # aiohttp не зовёт резолвер для IP-литералов: подставил в URL 127.0.0.1 -
-    # и он ушёл в сеть вообще без проверки. Такие адреса отсекаем сами, до
-    # установления соединения.
-    try:
-        literal = bool(ipaddress.ip_address(host))
-    except ValueError:
-        literal = False
-    if literal and not _is_public(host):
-        raise LinkError(
-            f"Ссылка ведёт на внутренний адрес ({host}). "
-            f"Бот качает только из открытого интернета."
-        )
-
-    timeout = aiohttp.ClientTimeout(total=None, sock_connect=20, sock_read=60)
-    connector = aiohttp.TCPConnector(resolver=PublicOnlyResolver())
-    async with aiohttp.ClientSession(
-        connector=connector, timeout=timeout, headers={"User-Agent": USER_AGENT}
-    ) as session:
-        if "disk.yandex" in host or "yadi.sk" in host:
-            return await _download_yandex(session, url, dest, progress)
-        if host in ("drive.google.com", "docs.google.com",
-                    "drive.usercontent.google.com"):
-            return await _download_gdrive(session, url, dest, progress)
-        async with session.get(url) as resp:
-            return await _pump(resp, dest, progress)
-
-
 def _media_problems(duration: int, width: int | None, height: int | None,
                     banner_path, brand: str, config: dict) -> str | None:
     """Общие проверки исходника. duration/width/height приходят из Telegram для
@@ -735,9 +515,9 @@ async def _render_and_send(message: Message, state: FSMContext, msg: Message,
                             position: str):
     """Рендерит баннер на уже скачанный исходник и отправляет результат.
 
-    Скачивание (файл из Telegram или по ссылке) делает вызывающий и заодно
-    создаёт msg для прогресса. Сюда приходит готовый in_vid, поэтому рендер,
-    подписи и отправка общие для обоих путей.
+    Скачивание файла из Telegram делает вызывающий и заодно создаёт msg для
+    прогресса. Сюда приходит готовый in_vid, поэтому рендер, подписи и
+    отправка живут в одном месте.
     """
     config = render.load_brand(brand)
     label = render.BRAND_LABELS.get(brand, brand.upper())
@@ -919,120 +699,17 @@ async def process_video(message: Message, state: FSMContext):
         await bot.download_file(tg_file.file_path, destination=in_vid)
     except Exception as e:
         # get_file на файле крупнее 20 МБ падает сам, и раньше эта ошибка
-        # уезжала в общий except в самом конце пайплайна. Ловим здесь и сразу
-        # предлагаем ссылку - по ней ограничения Telegram не действуют.
+        # уезжала в общий except в самом конце пайплайна. Ловим здесь и
+        # объясняем причину до того, как юзер увидит сырой TelegramBadRequest.
         in_vid.unlink(missing_ok=True)
         return await message.answer(
             f"❌ Не смог скачать ролик из Telegram: {html.escape(str(e))[:200]}\n\n"
-            f"Пришли файл помельче или кинь <b>ссылку</b> на него — "
-            f"по ссылке я качаю без ограничения Telegram.",
+            f"Файл весит больше {TG_DOWNLOAD_LIMIT // 1024 // 1024} МБ, а бот "
+            f"получает из Telegram не больше — это потолок Telegram.\n\n"
+            f"📱 Пережми на телефоне: открой ролик → <b>Поделиться</b> → "
+            f"<b>Сохранить видео</b>.",
             parse_mode="HTML",
         )
-    return await _render_and_send(
-        message, state, msg, in_vid, out_vid, banner_path, platform, brand, variant, position
-    )
-
-
-@dp.message(VideoState.waiting_for_video, F.text)
-async def process_link(message: Message, state: FSMContext):
-    """Ролик приходит ссылкой.
-
-    Нужно потому, что Telegram отдаёт боту файлы максимум 20 МБ: ролик крупнее
-    в чат не загрузится никак. По URL бот качает сам, и там ограничение только
-    наше - диск и память хостинга.
-    """
-    url = extract_url(message.text or "")
-    if not url:
-        return await message.answer(
-            "Пришли <b>файлом</b> ролик или <b>ссылкой</b> на него.\n\n"
-            "🔗 Подойдёт прямая ссылка на видео либо публичная ссылка Google Drive "
-            "или Яндекс.Диска — то, что отдаёт сам файл, а не страницу.",
-            parse_mode="HTML",
-        )
-
-    data = await state.get_data()
-    platform = data.get("chosen_platform")
-    brand = data.get("chosen_brand")
-    variant = data.get("chosen_variant")
-    if not platform or not brand:
-        await state.clear()
-        return await message.answer(
-            "❌ Сначала выбери платформу и бренд.",
-            reply_markup=get_platforms_keyboard(),
-        )
-
-    config = render.load_brand(brand)
-    banner_path = render.find_banner(brand, config, platform=platform, variant=variant)
-    # Баннер проверяем до скачивания: если его нет, файл качать незачем.
-    problem = _banner_problem(brand, platform, config, banner_path)
-    if problem:
-        return await message.answer(problem, parse_mode="HTML")
-
-    position = render.resolve_position(config, data.get("chosen_position"))
-    label = render.BRAND_LABELS.get(brand, brand.upper())
-    platform_label = render.PLATFORM_LABELS.get(platform, platform.upper())
-    position_label = render.POSITION_LABELS[position]
-    # Название варианта показываем в прогрессе, чтобы было видно, что в ролик
-    # едет именно тот баннер, который выбрали, а не первый файл в папке.
-    variant_title = ""
-    if variant:
-        for v in render.list_variants(brand, config):
-            if v["file"] == variant:
-                variant_title = f" · {v['title']}"
-                break
-
-    tag = hashlib.sha1(url.encode("utf-8", "ignore")).hexdigest()[:12]
-    in_vid = BASE / "videos" / f"in_link_{tag}.mp4"
-    out_vid = BASE / "videos" / f"out_link_{tag}.mp4"
-
-    async def on_progress(done: int, total: int | None):
-        got = f"{done / 1024 / 1024:.0f} МБ"
-        if total:
-            got += f" из {total / 1024 / 1024:.0f} МБ ({done * 100 // total}%)"
-        try:
-            await safe_edit(msg, f"⏳ <b>Качаю ролик по ссылке</b> · {got}",
-                            parse_mode="HTML")
-        except Exception:
-            pass
-
-    msg = await message.answer(
-        f"⏳ <b>Качаю ролик по ссылке</b>\n"
-        f"<i>{label} · {platform_label} · {position_label}{variant_title}</i>",
-        parse_mode="HTML",
-    )
-    try:
-        await download_by_url(url, in_vid, progress=on_progress)
-    except LinkError as e:
-        in_vid.unlink(missing_ok=True)
-        return await message.answer(f"❌ {html.escape(str(e))}", parse_mode="HTML")
-    except Exception as e:
-        in_vid.unlink(missing_ok=True)
-        print(f"[LINK-ERROR] {url}: {type(e).__name__}: {e}")
-        return await message.answer(
-            f"❌ Не смог скачать по ссылке: <code>{type(e).__name__}</code>\n"
-            f"<i>{html.escape(str(e))[:200]}</i>",
-            parse_mode="HTML",
-        )
-
-    # Геометрию и длительность узнаём из самого файла: в ответе на ссылку их
-    # нет, а Telegram доверять меткам с каждым пережатием тоже нельзя.
-    try:
-        vw, vh, duration = render.probe(in_vid)
-    except Exception:
-        in_vid.unlink(missing_ok=True)
-        return await message.answer(
-            "❌ По ссылке скачался не видеофайл.\n\n"
-            "Нужен mp4/mov, а не аудио, архив или веб-страница.",
-            parse_mode="HTML",
-        )
-
-    problem = _media_problems(
-        int(round(duration or 0)), vw, vh, banner_path, brand, config
-    )
-    if problem:
-        in_vid.unlink(missing_ok=True)
-        return await message.answer(problem, parse_mode="HTML")
-
     return await _render_and_send(
         message, state, msg, in_vid, out_vid, banner_path, platform, brand, variant, position
     )
