@@ -1,0 +1,23 @@
+{
+  "brand": "musor_drop",
+  "title": "Musor Drop",
+  "media": "musordrop_green-screen.mp4",
+  "media_by_platform": {
+    "tiktok": "musordrop_green-screen.mp4",
+    "insta": "musordrop_green-screen.mp4",
+    "shorts": "musordrop_green-screen.mp4"
+  },
+  "chroma_key": { "color": "auto", "similarity": 0.06, "blend": 0.02 },
+  "width_ratio": 0.85,
+  "anchor": "bottom",
+  "gap_ratio": 0.04,
+  "min_area_ratio": 0.1667,
+  "loop": "eof_action",
+  "insertion": {
+    "mode": "once",
+    "at": 0.5,
+    "audio": true,
+    "position": "user"
+  },
+  "notes": "Баннер на зелёном фоне 1902x1000, один и тот же для TikTok, Reels и Shorts - вариантов нет, поэтому выбор варианта не показывается. Ролик должен один раз остановиться в середине, отыграть баннер вместе со звуком и продолжиться дальше без сдвига. Позицию юзер выбирает сам (снизу/сверху/по центру), поэтому insertion.position=user. Кадр баннера анимированный и в отдельных кадрах выходит почти на всю высоту, поэтому статичный кроп зелёных полей отключён: зелёный убирается colorkey прямо в рендере."
+}

@@ -36,6 +36,7 @@ render_lock = asyncio.Lock()
 class VideoState(StatesGroup):
     chosen_platform = State()
     chosen_brand = State()
+    chosen_variant = State()
     chosen_position = State()
     waiting_for_video = State()
 
@@ -72,6 +73,9 @@ def brand_button_text(brand: str, platform: str | None = None) -> str:
     if config.get("chroma_key"):
         marks.append("🟢хромакей")
     marks.append(f"{int(config.get('width_ratio', 0.8) * 100)}% ширины")
+    variants = render.list_variants(brand, config)
+    if len(variants) > 1:
+        marks.append(f"{len(variants)} варианта")
     if not render.find_banner(brand, config, platform=platform):
         marks.append("❌ нет файла")
     return f"{label} · {' · '.join(marks)}"
@@ -142,28 +146,72 @@ async def process_platform(callback: CallbackQuery, state: FSMContext):
     )
 
 
-def get_positions_keyboard():
+def get_variants_keyboard(brand: str):
+    """Клавиатура выбора варианта баннера внутри бренда."""
+    config = render.load_brand(brand)
+    builder = InlineKeyboardBuilder()
+    for v in render.list_variants(brand, config):
+        # Имя файла в callback_data: оно короткое, латиницей и не ломает парсинг.
+        builder.button(text=v["title"], callback_data=f"var_{v['file']}")
+    builder.button(text="🔙 Назад", callback_data="back_to_brands")
+    builder.adjust(1, 1)
+    return builder.as_markup()
+
+
+def get_positions_keyboard(brand: str | None = None):
     builder = InlineKeyboardBuilder()
     for position in render.POSITIONS:
         builder.button(
             text=render.POSITION_LABELS[position],
             callback_data=f"pos_{position}",
         )
-    builder.button(text="🔙 Назад", callback_data="back_to_brands")
+    # Назад ведёт на выбор варианта, если у бренда он есть, иначе - на бренды.
+    back = "back_to_variants" if brand and render.list_variants(
+        brand, render.load_brand(brand)) else "back_to_brands"
+    builder.button(text="🔙 Назад", callback_data=back)
     builder.adjust(2, 2)
     return builder.as_markup()
 
 
-async def send_ready_message(message: Message, platform: str, brand: str, position: str):
+async def finish_setup(message: Message, state: FSMContext, platform: str, brand: str,
+                       variant: str | None = None):
+    """Доводит выбор до конца и уводит в ожидание ролика.
+
+    Вопрос про позицию задаётся не всегда: у бренда с однократной вставкой и
+    insertion.position = "fixed" выбор всё равно игнорируется, и спрашивать
+    юзера про то, что потом не применяется, - враньё в интерфейсе. Такой бренд
+    сразу спрашивает ролик. С insertion.position = "user" (Musor Drop)
+    позиция выбирается как обычно.
+    """
+    config = render.load_brand(brand)
+    insertion = render.resolve_insertion(config)
+    if insertion and insertion.get("position") != "user":
+        position = render.resolve_position(config, None)
+        await state.update_data(chosen_position=position, chosen_variant=variant)
+        await state.set_state(VideoState.waiting_for_video)
+        return await send_ready_message(message, platform, brand, position, variant)
+
+    await state.update_data(chosen_variant=variant)
+    await state.set_state(VideoState.chosen_position)
+    return await message.edit_text(
+        f"✅ Формат: <b>{render.PLATFORM_LABELS.get(platform, (platform or '?').upper())}</b>\n"
+        f"Бренд: <b>{render.BRAND_LABELS.get(brand, config.get('title', brand))}</b>\n\n"
+        f"Где поставить баннер?\n\n"
+        f"{POSITION_HINT}",
+        reply_markup=get_positions_keyboard(brand),
+        parse_mode="HTML",
+    )
+
+
+async def send_ready_message(message: Message, platform: str, brand: str, position: str,
+                              variant: str | None = None):
     """Финальная карточка перед отправкой ролика: что выбрано, куда ляжет
     баннер и сколько он занимает. Реклама обещаний не даём - только цифры."""
     config = render.load_brand(brand)
     label = render.BRAND_LABELS.get(brand, config.get("title", brand))
     platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
 
-    per_platform = config.get("media_by_platform") or {}
-    expected = per_platform.get(platform) or config.get("media") or "banner.mp4"
-    banner_path = render.find_banner(brand, config, platform=platform)
+    banner_path = render.find_banner(brand, config, platform=platform, variant=variant)
 
     # Считаем раскладку заранее, чтобы предупредить про площадь сразу,
     # а не через 3 минуты ожидания рендера.
@@ -208,6 +256,29 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
             f"слишком вытянутые. Рендер всё равно пойдёт, но площадь недобор.</i>",
         ]
 
+    # Требования к длине при однократной вставке: баннер занимает середину
+    # ролика целиком, поэтому слишком короткий ролик вставка съедает целиком.
+    ins = (plan.get("insertion") or plan.get("insertion_required")) if plan else None
+    if ins:
+        # Ролик ещё не загружен, поэтому конкретное окно вставки ещё неизвестно -
+        # сообщаем правило и порог, а секунды скажем после загрузки ролика.
+        min_total = ins.get("min_total") or render.min_total_duration(
+            ins["banner_duration"], render.resolve_insertion(config))
+        lines.append(f"• <b>не короче {min_total:.0f} секунд</b> — баннер идёт "
+                     f"в середине ролика и занимает {ins['banner_duration']:.0f} сек")
+        lines += [
+            "",
+            f"🎞 Баннер покажется <b>один раз в середине</b>: ролик на "
+            f"{ins['banner_duration']:.0f} сек замрёт, баннер отыграет, "
+            f"ролик пойдёт дальше с того же места. Длина не изменится.",
+        ]
+    if plan and plan.get("audio_warning") == "no_banner_audio":
+        lines += [
+            "",
+            "🔇 <i>У этого баннера нет звуковой дорожки — во время вставки "
+            "продолжится звук исходного ролика.</i>",
+        ]
+
     await message.edit_text("\n".join(lines), parse_mode="HTML")
 
 
@@ -223,6 +294,7 @@ async def process_position(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     platform = data.get("chosen_platform")
     brand = data.get("chosen_brand")
+    variant = data.get("chosen_variant")
     if not platform or not brand:
         await state.clear()
         return await callback.message.edit_text(
@@ -232,7 +304,54 @@ async def process_position(callback: CallbackQuery, state: FSMContext):
 
     await state.update_data(chosen_position=position)
     await state.set_state(VideoState.waiting_for_video)
-    await send_ready_message(callback.message, platform, brand, position)
+    await send_ready_message(callback.message, platform, brand, position, variant)
+
+
+@dp.callback_query(F.data.startswith("var_"))
+async def process_variant(callback: CallbackQuery, state: FSMContext):
+    """Выбор варианта баннера внутри бренда: у FunPay это игры или сервисы."""
+    if not await is_subscribed(callback.from_user.id):
+        return
+    variant = callback.data.split("_", 1)[1]
+
+    data = await state.get_data()
+    platform = data.get("chosen_platform")
+    brand = data.get("chosen_brand")
+    if not platform or not brand:
+        await state.clear()
+        return await callback.message.edit_text(
+            "❌ Сначала выбери платформу и бренд.",
+            reply_markup=get_platforms_keyboard(),
+        )
+
+    config = render.load_brand(brand)
+    # Файл приходит из callback_data, поэтому проверяем его по списку
+    # вариантов: иначе в рендер уехал бы любой путь из сообщения.
+    files = {v["file"] for v in render.list_variants(brand, config)}
+    if variant not in files:
+        await callback.answer("❌ Неизвестный вариант", show_alert=True)
+        return
+
+    label = render.BRAND_LABELS.get(brand, config.get("title", brand))
+    platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
+
+    await state.update_data(chosen_variant=variant)
+    # Дальше - вопрос про позицию или сразу ролик, решает finish_setup: у
+    # однократной вставки с фиксированной позицией вопроса нет.
+    return await finish_setup(callback.message, state, platform, brand, variant)
+
+
+@dp.callback_query(F.data == "back_to_variants")
+async def back_to_variants(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    brand = data.get("chosen_brand")
+    if not brand:
+        return await back_to_brands(callback, state)
+    await state.set_state(VideoState.chosen_variant)
+    await callback.message.edit_text(
+        "Какой баннер?",
+        reply_markup=get_variants_keyboard(brand),
+    )
 
 
 @dp.callback_query(F.data == "back_to_brands")
@@ -240,6 +359,8 @@ async def back_to_brands(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     platform = data.get("chosen_platform")
     await state.set_state(VideoState.chosen_brand)
+    # Вариант сбрасываем: у другого бренда его может не быть вовсе.
+    await state.update_data(chosen_variant=None)
     label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
     await callback.message.edit_text(
         f"✅ Формат: <b>{label}</b>\n\nВыбери бренд:",
@@ -260,7 +381,6 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
         return
 
     await state.update_data(chosen_brand=brand)
-    await state.set_state(VideoState.chosen_position)
 
     data = await state.get_data()
     platform = data.get("chosen_platform")
@@ -268,11 +388,24 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
     label = render.BRAND_LABELS.get(brand, config.get("title", brand))
     platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
 
-    per_platform = config.get("media_by_platform") or {}
-    expected = per_platform.get(platform) or config.get("media") or "banner.mp4"
+    # Бренд с вариантами (у FunPay это игры и сервисы) сначала спрашивает, какой
+    # ролик показать, и только потом - куда его поставить.
+    if render.list_variants(brand, config):
+        await state.set_state(VideoState.chosen_variant)
+        return await callback.message.edit_text(
+            f"✅ Формат: <b>{platform_label}</b>\n"
+            f"Бренд: <b>{label}</b>\n\n"
+            f"Какой баннер?",
+            reply_markup=get_variants_keyboard(brand),
+            parse_mode="HTML",
+        )
+
+    await state.set_state(VideoState.chosen_position)
     banner_path = render.find_banner(brand, config, platform=platform)
 
     if not banner_path:
+        expected = (config.get("media_by_platform") or {}).get(platform) \
+            or config.get("media") or "banner.mp4"
         return await callback.message.edit_text(
             f"❌ <b>Баннер не найден на сервере</b>\n\n"
             f"Формат: <b>{platform_label}</b>\n"
@@ -282,14 +415,8 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
             parse_mode="HTML",
         )
 
-    await callback.message.edit_text(
-        f"✅ Формат: <b>{platform_label}</b>\n"
-        f"Бренд: <b>{label}</b>\n\n"
-        f"Где поставить баннер?\n\n"
-        f"{POSITION_HINT}",
-        reply_markup=get_positions_keyboard(),
-        parse_mode="HTML",
-    )
+    # Дальше - вопрос про позицию или сразу ролик, решает finish_setup.
+    return await finish_setup(callback.message, state, platform, brand)
 
 
 @dp.message(VideoState.waiting_for_video, F.video)
@@ -301,17 +428,41 @@ async def process_video(message: Message, state: FSMContext):
     data = await state.get_data()
     platform = data.get("chosen_platform")
     brand = data.get("chosen_brand")
+    variant = data.get("chosen_variant")
 
     if not platform or not brand:
         await state.clear()
         return await message.answer("❌ Сначала выбери платформу и бренд.", reply_markup=get_platforms_keyboard())
 
     config = render.load_brand(brand)
-    banner_path = render.find_banner(brand, config, platform=platform)
+    # Файл берём по выбранному варианту: у FunPay это games или services, и
+    # без variant find_banner отдал бы первый попавшийся в папке.
+    banner_path = render.find_banner(brand, config, platform=platform, variant=variant)
     # Позицию нормализуем здесь: в state могли прийти мусорные данные, а
     # resolve_position гарантирует одну из POSITIONS и не даёт баннеру уехать
     # под кнопки интерфейса.
     position = render.resolve_position(config, data.get("chosen_position"))
+
+    # Короткий ролик при однократной вставке отсекаем ДО скачивания: баннер
+    # занимает середину ролика целиком, и в 20-секундный ролик 20-секундный
+    # баннер влезет только формально - исходника не останется ни до, ни после.
+    if banner_path and duration > 0:
+        insertion = render.resolve_insertion(config)
+        if insertion:
+            _, _, banner_duration = render.probe(banner_path)
+            min_total = render.min_total_duration(banner_duration, insertion)
+            if duration < min_total:
+                return await message.answer(
+                    f"❌ <b>Ролик короче {min_total:.0f} секунд</b> "
+                    f"({duration} сек).\n\n"
+                    f"Баннер {render.BRAND_LABELS.get(brand, config.get('title', brand))} "
+                    f"показывается один раз в середине ролика и "
+                    f"занимает {banner_duration:.0f} сек, а до и после него должно "
+                    f"остаться хотя бы {render.MIN_TAIL_SECONDS:.0f} сек "
+                    f"исходника — иначе вставка съедает ролик целиком.\n\n"
+                    f"📱 Возьми ролик подлиннее или вырежи лишнее.",
+                    parse_mode="HTML",
+                )
 
     # Отсекаем горизонтальные ролики: safe zones заданы под вертикальный 9:16,
     # на альбомном кадре баннер уедет в неправильное место.
@@ -351,12 +502,19 @@ async def process_video(message: Message, state: FSMContext):
     label = render.BRAND_LABELS.get(brand, brand.upper())
     platform_label = render.PLATFORM_LABELS.get(platform, platform.upper())
     position_label = render.POSITION_LABELS[position]
+    # Название варианта показываем в прогрессе, чтобы было видно, что в ролик
+    # едет именно тот баннер, который выбрали, а не первый файл в папке.
+    variant_title = ""
+    if variant:
+        for v in render.list_variants(brand, config):
+            if v["file"] == variant:
+                variant_title = f" · {v['title']}"
+                break
     msg = await message.answer(
         f"⏳ Скачиваю ролик и рендерю <b>{label}</b> на {platform_label} "
-        f"({position_label})...",
+        f"({position_label}{variant_title})...",
         parse_mode="HTML",
     )
-
     file_id = message.video.file_id
     in_vid = BASE / "videos" / f"in_{file_id}.mp4"
     out_vid = BASE / "videos" / f"out_{file_id}.mp4"
@@ -421,6 +579,13 @@ async def process_video(message: Message, state: FSMContext):
                 f"\nГрафика анимирована: полностью развернутая видна на "
                 f"{plan['visible_area_ratio'] * 100:.0f}% экрана, в сжатых кадрах — меньше."
             )
+        ins_note = ""
+        if plan.get("insertion"):
+            i = plan["insertion"]
+            ins_note = (f"\n🎞 Баннер один раз: {i['t_start']:.0f}–{i['t_end']:.0f} сек, "
+                        f"ролик на это время замрёт и пойдёт дальше без сдвига")
+            if plan.get("audio_warning") == "no_banner_audio":
+                ins_note += "\n🔇 У баннера нет звука — в этот момент продолжился звук ролика"
         await msg.edit_text("🚀 Загружаю результат...")
         await message.answer_video(
             video=FSInputFile(out_vid),
@@ -428,6 +593,7 @@ async def process_video(message: Message, state: FSMContext):
                 f"Готово ({label} · {platform_label} · {position_label})\n"
                 f"Баннер {bw}×{bh} — {plan['area_ratio'] * 100:.0f}% экрана"
                 + anim
+                + ins_note
                 + warn
             ),
         )
@@ -504,11 +670,15 @@ async def main():
     for brand in brands:
         config = render.load_brand(brand)
         per_platform = config.get("media_by_platform") or {}
+        variants = render.list_variants(brand, config)
         for platform in platforms:
             found = render.find_banner(brand, config, platform=platform)
             state = f"OK {found.name}" if found else "НЕТ ФАЙЛА БАННЕРА"
             marker = "" if platform not in per_platform else " *"
             print(f"  {brand}/{platform}{marker}: {state}")
+        # Варианты не зависят от площадки, поэтому печатаем их один раз.
+        for v in variants:
+            print(f"  {brand}/вариант: OK {v['file']} — {v['title']}")
         if not per_platform and not render.find_banner(brand, config):
             print(f"  {brand}: НЕТ ФАЙЛА БАННЕРА")
     await dp.start_polling(bot)
