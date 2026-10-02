@@ -556,11 +556,19 @@ def resolve_insertion(config):
     position = ins.get("position")
     if position not in ("user", "fixed"):
         position = "fixed"
+    # Сколько исходника должно остаться по краям вставки. Бренд с коротким
+    # баннером может разрешить меньше: в 10-секундном ролике баннер на 6 сек
+    # оставляет по 2 сек с каждой стороны, и это выглядит нормально.
+    try:
+        min_tail = float(ins.get("min_tail", MIN_TAIL_SECONDS))
+    except (TypeError, ValueError):
+        min_tail = MIN_TAIL_SECONDS
     return {
         "mode": "once",
         "at": min(1.0, max(0.0, at)),
         "audio": bool(ins.get("audio", True)),
         "position": position,
+        "min_tail": max(0.0, min_tail),
     }
 
 
@@ -581,15 +589,17 @@ def plan_insertion(duration, banner_duration, insertion):
     else:
         t_start = free * insertion["at"]
         t_end = t_start + banner_duration
+    min_tail = float(insertion.get("min_tail", MIN_TAIL_SECONDS))
     return {
         "t_start": round(t_start, 3),
         "t_end": round(min(t_end, duration), 3),
         "banner_duration": round(banner_duration, 3),
         "at": insertion["at"],
         "fits": free >= 0,
+        "min_tail": min_tail,
         # Хватает ли исходника по краям, чтобы вставка не съела ролик целиком.
-        "has_head": t_start >= MIN_TAIL_SECONDS,
-        "has_tail": (duration - t_end) >= MIN_TAIL_SECONDS,
+        "has_head": t_start >= min_tail,
+        "has_tail": (duration - t_end) >= min_tail,
     }
 
 
@@ -599,14 +609,16 @@ def min_total_duration(banner_duration, insertion):
     Считает ту же формулу, что plan_insertion (окно строится по доле at от
     свободного времени), поэтому проверка в боте и сам рендер не могут
     разойтись: баннер в 20 с и минимум 3 с исходника по краям требуют 26 с.
+    Бренд может разрешить меньше через insertion.min_tail.
     """
     if not insertion or banner_duration <= 0:
         return 0.0
     at = insertion.get("at", 0.5)
+    min_tail = float(insertion.get("min_tail", MIN_TAIL_SECONDS))
     # Требование симметрично при at = 0.5; при других at нужно закрыть худший
     # край, то есть max(at, 1 - at) от свободного времени.
     tail = max(at, 1.0 - at)
-    return banner_duration + MIN_TAIL_SECONDS / tail
+    return banner_duration + min_tail / tail
 
 
 def position_slot(x0, y0, x1, y1, position):

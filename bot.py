@@ -689,7 +689,7 @@ def _media_problems(duration: int, width: int | None, height: int | None,
                     f"Баннер {render.BRAND_LABELS.get(brand, config.get('title', brand))} "
                     f"показывается один раз в середине ролика и "
                     f"занимает {banner_duration:.0f} сек, а до и после него должно "
-                    f"остаться хотя бы {render.MIN_TAIL_SECONDS:.0f} сек "
+                    f"остаться хотя бы {insertion.get('min_tail', render.MIN_TAIL_SECONDS):g} сек "
                     f"исходника — иначе вставка съедает ролик целиком.\n\n"
                     f"📱 Возьми ролик подлиннее или вырежи лишнее."
                 )
