@@ -1,4 +1,5 @@
 import os
+import html
 import asyncio
 import threading
 from pathlib import Path
@@ -7,6 +8,7 @@ from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.filters import Command
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -27,10 +29,32 @@ dp = Dispatcher()
 
 MAX_DURATION = 59
 
+# Жёсткие лимиты Bot API: getFile отдаёт не больше 20 МБ, sendVideo принимает
+# не больше 50 МБ. Это ограничение самого Telegram, обойти его нельзя, поэтому
+# проверяем заранее и говорим юзеру понятную причину, а не сырой TelegramBadRequest.
+TG_DOWNLOAD_LIMIT = 20 * 1024 * 1024
+TG_UPLOAD_LIMIT = 50 * 1024 * 1024
+
 # Рендер ОДИН за раз. Замеры: ролик 1080x1920@60 на insta ест 415 МБ из 512 МБ
 # контейнера. Два параллельных ffmpeg - это 800 МБ, и Render убьёт контейнер
 # с OOM, уронив рендеры обоих. Второй и последующие ждут в очереди.
 render_lock = asyncio.Lock()
+
+
+async def safe_edit(message: Message, text: str, **kwargs):
+    """edit_text, который не падает, если текст не изменился.
+
+    Telegram отвечает "message is not modified", когда новое содержимое
+    совпадает с текущим. Для нас это не ошибка: сообщение уже в нужном виде.
+    Случай частый - двойной тап по кнопке или повторная доставка callback.
+    Любые другие ошибки редактирования прокидываем наверх.
+    """
+    try:
+        return await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as e:
+        if "message is not modified" in str(e):
+            return None
+        raise
 
 
 class VideoState(StatesGroup):
@@ -111,7 +135,7 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "check_sub")
 async def process_sub_check(callback: CallbackQuery):
     if await is_subscribed(callback.from_user.id):
-        await callback.message.edit_text(
+        await safe_edit(callback.message,
             "✅ Доступ открыт.\n\n📱 Выбери платформу:", reply_markup=get_platforms_keyboard()
         )
     else:
@@ -121,7 +145,7 @@ async def process_sub_check(callback: CallbackQuery):
 @dp.callback_query(F.data == "back_to_platforms")
 async def back_to_platforms(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text(
+    await safe_edit(callback.message,
         "📱 Выбери формат/платформу:", reply_markup=get_platforms_keyboard()
     )
 
@@ -137,7 +161,7 @@ async def process_platform(callback: CallbackQuery, state: FSMContext):
     await state.update_data(chosen_platform=platform)
     await state.set_state(VideoState.chosen_brand)
     label = render.PLATFORM_LABELS.get(platform, platform.upper())
-    await callback.message.edit_text(
+    await safe_edit(callback.message,
         f"✅ Формат: <b>{label}</b>\n\n"
         f"Ролик должен быть <b>вертикальным</b> (9:16, обычно 1080×1920).\n"
         f"Теперь выбери бренд:",
@@ -193,7 +217,7 @@ async def finish_setup(message: Message, state: FSMContext, platform: str, brand
 
     await state.update_data(chosen_variant=variant)
     await state.set_state(VideoState.chosen_position)
-    return await message.edit_text(
+    return await safe_edit(message,
         f"✅ Формат: <b>{render.PLATFORM_LABELS.get(platform, (platform or '?').upper())}</b>\n"
         f"Бренд: <b>{render.BRAND_LABELS.get(brand, config.get('title', brand))}</b>\n\n"
         f"Где поставить баннер?\n\n"
@@ -279,7 +303,7 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
             "продолжится звук исходного ролика.</i>",
         ]
 
-    await message.edit_text("\n".join(lines), parse_mode="HTML")
+    await safe_edit(message, "\n".join(lines), parse_mode="HTML")
 
 
 @dp.callback_query(F.data.startswith("pos_"))
@@ -297,7 +321,7 @@ async def process_position(callback: CallbackQuery, state: FSMContext):
     variant = data.get("chosen_variant")
     if not platform or not brand:
         await state.clear()
-        return await callback.message.edit_text(
+        return await safe_edit(callback.message,
             "❌ Сначала выбери платформу и бренд.",
             reply_markup=get_platforms_keyboard(),
         )
@@ -319,7 +343,7 @@ async def process_variant(callback: CallbackQuery, state: FSMContext):
     brand = data.get("chosen_brand")
     if not platform or not brand:
         await state.clear()
-        return await callback.message.edit_text(
+        return await safe_edit(callback.message,
             "❌ Сначала выбери платформу и бренд.",
             reply_markup=get_platforms_keyboard(),
         )
@@ -348,7 +372,7 @@ async def back_to_variants(callback: CallbackQuery, state: FSMContext):
     if not brand:
         return await back_to_brands(callback, state)
     await state.set_state(VideoState.chosen_variant)
-    await callback.message.edit_text(
+    await safe_edit(callback.message,
         "Какой баннер?",
         reply_markup=get_variants_keyboard(brand),
     )
@@ -362,7 +386,7 @@ async def back_to_brands(callback: CallbackQuery, state: FSMContext):
     # Вариант сбрасываем: у другого бренда его может не быть вовсе.
     await state.update_data(chosen_variant=None)
     label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
-    await callback.message.edit_text(
+    await safe_edit(callback.message,
         f"✅ Формат: <b>{label}</b>\n\nВыбери бренд:",
         reply_markup=get_brands_keyboard(platform=platform),
         parse_mode="HTML",
@@ -392,7 +416,7 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
     # ролик показать, и только потом - куда его поставить.
     if render.list_variants(brand, config):
         await state.set_state(VideoState.chosen_variant)
-        return await callback.message.edit_text(
+        return await safe_edit(callback.message,
             f"✅ Формат: <b>{platform_label}</b>\n"
             f"Бренд: <b>{label}</b>\n\n"
             f"Какой баннер?",
@@ -406,7 +430,7 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
     if not banner_path:
         expected = (config.get("media_by_platform") or {}).get(platform) \
             or config.get("media") or "banner.mp4"
-        return await callback.message.edit_text(
+        return await safe_edit(callback.message,
             f"❌ <b>Баннер не найден на сервере</b>\n\n"
             f"Формат: <b>{platform_label}</b>\n"
             f"Бренд: <b>{label}</b>\n\n"
@@ -424,6 +448,21 @@ async def process_video(message: Message, state: FSMContext):
     duration = message.video.duration or 0
     if duration > MAX_DURATION:
         return await message.answer(f"❌ Видео длиннее {MAX_DURATION} секунд ({duration} сек).")
+
+    # Telegram Bot API отдаёт боту файлы не крупнее 20 МБ: get_file падает с
+    # Bad Request: file is too big. Проверяем размер до скачивания и объясняем
+    # причину по-человечески, а не ловим сырое исключение в конце пайплайна.
+    size = message.video.file_size or 0
+    if size > TG_DOWNLOAD_LIMIT:
+        return await message.answer(
+            f"❌ <b>Ролик слишком тяжёлый</b>: {size / 1024 / 1024:.1f} МБ.\n\n"
+            f"Telegram отдаёт боту файлы не крупнее "
+            f"{TG_DOWNLOAD_LIMIT // 1024 // 1024} МБ, поэтому такой я скачать "
+            f"не смогу.\n\n"
+            f"📱 Обрежь его покороче или пережми "
+            f"(<b>Поделиться → Сохранить видео</b>) и пришли снова.",
+            parse_mode="HTML",
+        )
 
     data = await state.get_data()
     platform = data.get("chosen_platform")
@@ -538,7 +577,7 @@ async def process_video(message: Message, state: FSMContext):
                 if (ow, oh) != (vw, vh):
                     extra = f" Исходник {vw}×{vh} ужимается до {ow}×{oh}, чтобы влезать в память."
                 try:
-                    await msg.edit_text(
+                    await safe_edit(msg,
                         f"⏳ <b>Рендер идёт</b> · {label} · {platform_label}\n"
                         f"<i>Прошло {spent} сек.{extra}</i>"
                     )
@@ -548,7 +587,7 @@ async def process_video(message: Message, state: FSMContext):
         # Рендер строго по одному: два параллельных ffmpeg на 512 МБ не
         # помещаются. Если рендер уже идёт - честно говорим про очередь.
         if render_lock.locked():
-            await msg.edit_text(
+            await safe_edit(msg,
                 "⏳ <b>Рендер занят</b> — предыдущий ролик ещё собирается.\n"
                 "<i>Твой встанет в очередь, начну сразу, как освободится.</i>",
                 parse_mode="HTML",
@@ -586,7 +625,16 @@ async def process_video(message: Message, state: FSMContext):
                         f"ролик на это время замрёт и пойдёт дальше без сдвига")
             if plan.get("audio_warning") == "no_banner_audio":
                 ins_note += "\n🔇 У баннера нет звука — в этот момент продолжился звук ролика"
-        await msg.edit_text("🚀 Загружаю результат...")
+        out_size = out_vid.stat().st_size
+        if out_size > TG_UPLOAD_LIMIT:
+            await message.answer(
+                f"❌ Ролик собрался, но весит {out_size / 1024 / 1024:.0f} МБ — "
+                f"Telegram принимает от бота не больше "
+                f"{TG_UPLOAD_LIMIT // 1024 // 1024} МБ.\n\n"
+                f"📱 Возьми ролик покороче: баннер тот же, а результат легче.",
+            )
+            return
+        await safe_edit(msg, "🚀 Загружаю результат...")
         await message.answer_video(
             video=FSInputFile(out_vid),
             caption=(
@@ -598,10 +646,14 @@ async def process_video(message: Message, state: FSMContext):
             ),
         )
     except Exception as e:
+        # Причину показываем целиком: по одному "TelegramBadRequest" невозможно
+        # понять, что случилось - лимит размера, битый файл или что-то ещё.
+        reason = html.escape(str(e))[:300]
         await message.answer(
             f"❌ <b>Не получилось сделать ролик.</b>\n\n"
-            f"Причина на сервере: <code>{type(e).__name__}</code>\n"
-            f"Если это повторяется — скинь это сообщение разработчику.",
+            f"Причина: <code>{type(e).__name__}</code>\n"
+            f"<i>{reason}</i>\n\n"
+            f"Если повторяется — пришли это разработчику.",
             parse_mode="HTML",
         )
         print(f"[ERROR] {type(e).__name__}: {e}")
