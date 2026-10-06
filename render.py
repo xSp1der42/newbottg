@@ -30,6 +30,12 @@ PLATFORM_LABELS = {
     "shorts": "YouTube Shorts",
 }
 
+PLATFORM_LABELS = {
+    "tiktok": "TikTok",
+    "insta": "Instagram Reels",
+    "shorts": "YouTube Shorts",
+}
+
 # Где может стоять баннер: три положения по вертикали, все привязаны к краям
 # кадра. Боковых нет намеренно - узкая колонка не набирает площадь из ТЗ.
 # Прячем ли баннер под интерфейс площадки, решают insets в configs/platforms.json,

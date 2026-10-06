@@ -871,8 +871,8 @@ async def process_video(message: Message, state: FSMContext):
     # resolve_position гарантирует одну из POSITIONS и не даёт баннеру уехать
     # под кнопки интерфейса.
     position = render.resolve_position(config, data.get("chosen_position"))
-    # Режим остановки нормализуем тем же способом, что и позицию: мусор или
-    # старый state без этого ключа не должны молча ломать граф вставки.
+    # Заморозку тоже достаём сразу: в state её может ещё не быть, но
+    # resolve_freeze корректно обработает None.
     stop_video = render.resolve_freeze(config, data.get("chosen_freeze"))
 
     problem = _media_problems(
@@ -886,10 +886,13 @@ async def process_video(message: Message, state: FSMContext):
     if variant:
         for v in render.list_variants(brand, config):
             if v["file"] == variant:
-                variant_title = f" · {v['title']}"
+                variant_title = f" — {v['title']}"
                 break
+    label = render.BRAND_LABELS.get(brand, config.get("title", brand))
+    platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
+    position_label = render.POSITION_LABELS[position]
     msg = await message.answer(
-        f"⏳ Скачиваю ролик и рендерю <b>{label}</b> на {platform_label} "
+        f"⚙️ Обрабатываю видео в шаблоне <b>{label}</b> на {platform_label} "
         f"({position_label}{variant_title})...",
         parse_mode="HTML",
     )
