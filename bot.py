@@ -260,11 +260,14 @@ def get_freeze_keyboard():
 def needs_freeze_choice(config: dict) -> bool:
     """Спрашивать ли, останавливать ли ролик.
 
-    Вопрос имеет смысл только там, где баннер вставляется один раз посреди
-    ролика. У баннера, который зациклен на весь ролик (Playerok), остановки в
-    принципе нет - спрашивать было бы враньём в интерфейсе.
+    Вопрос нужен только у «отдельных» баннеров - тех, что проигрываются
+    самостоятельноным роликом посреди видео (Musor Drop). У накладываемых
+    поверх оверлеев (FunPay) спрашивать нечего: там ничего не встаёт.
+    Кнопка включается в конфиге бренда через "freeze_choice": true,
+    а не выводится из наличия insertion - вставка сама по себе не значит,
+    что юзер должен выбирать режим.
     """
-    return bool(render.resolve_insertion(config))
+    return bool(config.get("freeze_choice")) and bool(render.resolve_insertion(config))
 
 
 async def ask_freeze_or_ready(message: Message, state: FSMContext, platform: str,

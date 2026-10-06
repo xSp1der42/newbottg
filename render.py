@@ -21,6 +21,7 @@ BRAND_LABELS = {
     "funpay": "FunPay",
     "mycsgo": "MyCSGO",
     "1win": "1Win",
+    "bubavpn": "BubaVPN",
 }
 
 PLATFORM_LABELS = {
