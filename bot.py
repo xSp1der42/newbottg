@@ -842,7 +842,7 @@ async def process_video(message: Message, state: FSMContext):
     # Telegram Bot API отдаёт боту файлы не крупнее 20 МБ: get_file падает с
     # Bad Request: file is too big. Проверяем размер до скачивания и объясняем
     # причину по-человечески, а не ловим сырое исключение в конце пайплайна.
-    size = message.video.file_size or 0
+    size = getattr(message.video, "file_size", None) or 0
     if size > TG_DOWNLOAD_LIMIT:
         return await message.answer(
             f"❌ <b>Ролик слишком тяжёлый</b>: {size / 1024 / 1024:.1f} МБ.\n\n"
