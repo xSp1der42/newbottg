@@ -222,7 +222,38 @@ def find_banner(brand, config, platform=None, variant=None):
     return media_in_folder[0] if media_in_folder else None
 
 
-def detect_key_color(path, sample_size=96, frames=3):
+# --- Кэш замеров по файлу ----------------------------------------------------
+# Каждый ffprobe/ffmpeg на старте ест ~1 секунду (антivirus + демон), а один
+# клик по кнопке в боте зовёт их трижды. Ключ - путь + mtime + размер: файл
+# баннера меняется только при замене, поэтому кэш не протухает мимо рук.
+_FILE_CACHE: dict[str, dict] = {"probe": {}, "audio": {}, "key_color": {}}
+
+
+def _file_key(path, store_name):
+    """Ключ кэша по состоянию файла. None - файла нет, кэш неприменим."""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None
+    return str(path), st.st_mtime_ns, st.st_size
+
+
+def _cached(store_name, path, fn):
+    """Через ffprobe/ffmpeg, но с кэшем по файлу.
+
+    Исключения не кэшируются: упавший вызов должен упасть и повторно, а не
+    навсегда остаться в словаре как «плохой результат».
+    """
+    store = _FILE_CACHE[store_name]
+    key = _file_key(path, store_name)
+    if key is None:
+        return fn(Path(path))
+    if key not in store:
+        store[key] = fn(Path(path))
+    return store[key]
+
+
+def _measure_key_color(path, sample_size=96, frames=3):
     """Определяет цвет хромакея по рамке кадра.
 
     Идея: фон хромакейного баннера занимает края и он однотонный. Берём несколько
@@ -280,6 +311,13 @@ def detect_key_color(path, sample_size=96, frames=3):
         return None
 
     return (r, g, b)
+
+
+def detect_key_color(path, sample_size=96, frames=3):
+    """Цвет хромакея по рамке кадра. Замер кэшируется по файлу: без этого
+    detect_content_box гонял ffmpeg на каждый вызов plan_banner."""
+    return _cached("key_color", path,
+                   lambda p: _measure_key_color(p, sample_size, frames))
 
 
 def resolve_chroma(config, banner_path):
@@ -452,6 +490,10 @@ def has_audio(path):
     "со звуком" нечем, и мы обязаны сказать об этом, а не сделать вид, что
     выполнили требование.
     """
+    return _cached("audio", path, _measure_has_audio)
+
+
+def _measure_has_audio(path):
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "a:0",
@@ -463,7 +505,12 @@ def has_audio(path):
 
 
 def probe(path):
-    """Возвращает (w, h, duration) из ffprobe."""
+    """Возвращает (w, h, duration) из ffprobe. Кэшируется по файлу: одна
+    команда ffprobe стоит секунду, а за клик их было три."""
+    return _cached("probe", path, _measure_probe)
+
+
+def _measure_probe(path):
     cmd = [
         "ffprobe", "-v", "error",
         "-select_streams", "v:0",
@@ -515,13 +562,14 @@ def resolve_position(config, position=None):
     конфигов) молча падает на DEFAULT_POSITION, чтобы баннер гарантированно
     не уехал под кнопки интерфейса.
 
-    При вставке посреди ролика позиция по умолчанию фиксированая: карточка
-    поверх замершего кадра у края кадра выглядит обрезанной. Но бренд может
-    разрешить выбор юзера - insertion.position = "user" (Musor Drop), тогда
-    спрашиваем bottom/top/center как обычно.
+    Выбор юзера выигрывает у настройки бренда - иначе спрашивать его в боте
+    бессмысленно. Исключение одно: insertion.position = "fixed" прямо запрещает
+    выбор и берёт anchor бренда. По умолчанию "user", то есть позицию можно
+    выбрать у любого баннера.
     """
     ins = resolve_insertion(config) or {}
-    choice = position if ins.get("position") == "user" else None
+    forced = ins.get("position") == "fixed"
+    choice = None if forced else position
     pos = choice or config.get("position") or config.get("anchor") or DEFAULT_POSITION
     return pos if pos in POSITIONS else DEFAULT_POSITION
 
@@ -529,6 +577,11 @@ def resolve_position(config, position=None):
 # Минимум исходного ролика вокруг вставки, чтобы это не выглядело как
 # "ролик целиком проигран баннером". Три секунды - эмпирический минимум.
 MIN_TAIL_SECONDS = 3.0
+
+# Насколько приглушается звук ролика, когда баннер идёт поверх идущего видео
+# (вставка без остановки). Голос баннера звучит в полную силу, а ролик на
+# фоне остаётся слышным, но не спорит с рекламой. 0 - полная тишина ролика.
+DUCK_VOLUME = 0.2
 
 
 def resolve_insertion(config):
@@ -541,9 +594,13 @@ def resolve_insertion(config):
 
         "insertion": {"mode": "once", "at": 0.5, "audio": true}
 
-    insertion.position = "user" оставляет выбор позиции юзеру (для бренда,
-    которому подходит и верх, и низ). По умолчанию "fixed": позиция берётся
-    из anchor бренда, а выбор юзера игнорируется.
+    insertion.position = "user" оставляет выбор позиции юзеру (снизу/сверху/
+    по центру) - это поведение по умолчанию. "fixed" запрещает выбор и берёт
+    anchor бренда.
+
+    insertion.freeze = false показывает баннер поверх ИДУЩЕГО ролика: видео не
+    замирает, звук ролика приглушается под голос баннера. По умолчанию true -
+    ролик останавливается, как в исходном ТЗ.
     """
     ins = config.get("insertion") or {}
     if not isinstance(ins, dict) or ins.get("mode") != "once":
@@ -555,7 +612,7 @@ def resolve_insertion(config):
         at = 0.5
     position = ins.get("position")
     if position not in ("user", "fixed"):
-        position = "fixed"
+        position = "user"
     # Сколько исходника должно остаться по краям вставки. Бренд с коротким
     # баннером может разрешить меньше: в 10-секундном ролике баннер на 6 сек
     # оставляет по 2 сек с каждой стороны, и это выглядит нормально.
@@ -568,8 +625,22 @@ def resolve_insertion(config):
         "at": min(1.0, max(0.0, at)),
         "audio": bool(ins.get("audio", True)),
         "position": position,
+        "freeze": bool(ins.get("freeze", True)),
         "min_tail": max(0.0, min_tail),
     }
+
+
+def resolve_freeze(config, freeze=None):
+    """Останавливать ли ролик на время вставки баннера.
+
+    Выбор юзера важнее настройки бренда: иначе кнопка в боте ничего не меняла
+    бы. freeze=None означает "юзер не выбирал" - тогда берём insertion.freeze,
+    а при отсутствии вставки - True (вопрос и не задаётся в этом случае).
+    """
+    ins = resolve_insertion(config) or {}
+    if freeze is None:
+        return bool(ins.get("freeze", True))
+    return bool(freeze)
 
 
 def plan_insertion(duration, banner_duration, insertion):
@@ -777,7 +848,7 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, positio
 
 
 def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, position=None,
-                video_duration=0.0):
+                video_duration=0.0, freeze=None):
     """Считает план раскладки баннера, ничего не рендеря.
 
     Нужно, чтобы показать пользователю размер и предупредить про площадь
@@ -785,6 +856,9 @@ def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, pos
 
     video_w/video_h - размер ИСХОДНИКА. Если он выше потолка, раскладка
     считается для ужатого кадра - ровно так же, как это делает build_filter.
+
+    freeze - замирает ли ролик на время вставки. None = "юзер не выбирал",
+    тогда берём insertion.freeze.
     """
     banner_path = Path(banner_path)
     banner_w, banner_h, banner_duration = probe(banner_path)
@@ -804,6 +878,7 @@ def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, pos
     video_duration = float(video_duration or 0)
     ins = plan_insertion(video_duration, banner_duration, insertion) if insertion else None
     if ins:
+        ins["freeze"] = resolve_freeze(config, freeze)
         plan["insertion"] = ins
     elif insertion:
         # Длительность ролика ещё неизвестна (карточка перед загрузкой файла),
@@ -814,7 +889,11 @@ def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, pos
             "banner_duration": round(banner_duration, 3),
             "min_total": min_total_duration(banner_duration, insertion),
             "audio": bool(insertion.get("audio", True)),
+            "freeze": resolve_freeze(config, freeze),
         }
+    # Без вставки вопроса про остановку нет - отдаём None, чтобы карточка не
+    # обещала пользователю выбор, которого бот не задаёт.
+    plan["freeze"] = resolve_freeze(config, freeze) if insertion else None
     if insertion and not has_audio(banner_path):
         plan["audio_warning"] = "no_banner_audio"
     return plan
@@ -885,24 +964,70 @@ def _filter_insertion(vsrc, pos_x, pos_y, ins, bw, bh):
     return parts
 
 
-def build_audio_insertion(main_has_audio, banner_has_audio, ins, want_banner_audio):
+def _filter_insertion_live(vsrc, pos_x, pos_y, ins):
+    """Баннер поверх ИДУЩЕГО ролика - вставка без остановки.
+
+    Отличие от _filter_insertion принципиальное: исходник не трогаем вообще.
+    Ни split, ни trim, ни tpad - поток остаётся непрерывным, поэтому кадр под
+    баннером продолжает двигаться, и общая длительность ролика не меняется.
+    Баннер, как и при остановке, играет один раз в своём окне и сам собой
+    исчезает за его пределами (enable=between).
+    """
+    t0, t1 = ins["t_start"], ins["t_end"]
+    return [
+        f"[banner_keyed]setpts=PTS-STARTPTS+{t0:.3f}/TB[ins_banner]",
+        f"[{vsrc}][ins_banner]overlay={pos_x}:{pos_y}:"
+        f"enable='between(t,{t0:.3f},{t1:.3f})':eof_action=pass:shortest=0:format=auto[outv]",
+    ]
+
+
+def build_audio_insertion(main_has_audio, banner_has_audio, ins, want_banner_audio,
+                          freeze=True):
     """Граф звука для вставки.
 
-    Во время вставки основной звук вырезается, и вместо него идёт звук
-    баннера - это и есть "видео с паузой и звуком". Если звука у баннера
-    нет, основной звук не трогаем иначе в ролике получится непроходимая
+    При остановке (freeze=True) основной звук вырезается на время окна, и вместо
+    него идёт звук баннера - это и есть "видео с паузой и звуком". Если звука у
+    баннера нет, основной звук не трогаем иначе в ролике получится непроходимая
     тишина, и возвращаем None: звук останется непрерывным.
+
+    Без остановки (freeze=False) звук ролика непрерывен, а голос баннера
+    накладывается поверх в своё окно, и на это время ролик приглушается до
+    DUCK_VOLUME - иначе два источника звучали бы одновременно в полную силу.
     """
     if not want_banner_audio or not banner_has_audio:
         return None
 
     t0, t1 = ins["t_start"], ins["t_end"]
     dur = ins["banner_duration"]
-    head, tail = max(0.0, t0), max(0.0, ins.get("total", t1) - t1)
 
     fmt = "aformat=sample_rates=44100:channel_layouts=mono"
+
+    if not freeze:
+        if main_has_audio:
+            parts = [f"[0:a:0]volume={DUCK_VOLUME}:eval=frame:"
+                     f"enable='between(t,{t0:.3f},{t1:.3f})',{fmt}[au_main]"]
+        else:
+            # Основного звука нет - тишина нужной длины вместо него, иначе
+            # amix остался бы с одним входом и голос баннера пропал бы вовсе.
+            parts = [f"anullsrc=r=44100:cl=mono,{fmt}[au_main]"]
+        # Баннер звучит со своего нуля, поэтому сдвигаем его на начало окна.
+        parts.append(f"[1:a:0]atrim=start=0:end={dur:.3f},asetpts=PTS-STARTPTS,{fmt},"
+                     f"adelay={int(round(t0 * 1000))}[au_banner]")
+        # normalize=0 - сумма входов как есть: по умолчанию amix делит громкость
+        # на число входов, и приглушённый ролик стал бы ещё тише.
+        parts.append("[au_main][au_banner]amix=inputs=2:duration=first:"
+                     "dropout_transition=0:normalize=0[aout]")
+        return ";".join(parts)
+
+    head, tail = max(0.0, t0), max(0.0, ins.get("total", t1) - t1)
+    # Звук раздваиваем только когда есть чем пользоваться: у asplit=2 при
+    # нулевом хвосте второй выход остаётся неподключённым, и ffmpeg падает с
+    # "output 1 unconnected" - ровно на ролике длиной с баннер.
+    use_tail = main_has_audio and tail > 0.001
+
     if main_has_audio:
-        parts = [f"[0:a:0]asplit=2[au_h_src][au_t_src]"]
+        parts = [f"[0:a:0]asplit=2[au_h_src][au_t_src]"] if use_tail \
+            else [f"[0:a:0]anull[au_h_src]"]
         parts.append(f"[au_h_src]atrim=start=0:end={t0:.3f},asetpts=PTS-STARTPTS,{fmt}[au_head]")
     else:
         # Основного звука нет - тишина нужной длины вместо него.
@@ -911,7 +1036,7 @@ def build_audio_insertion(main_has_audio, banner_has_audio, ins, want_banner_aud
 
     parts.append(f"[1:a:0]atrim=start=0:end={dur:.3f},asetpts=PTS-STARTPTS,{fmt}[au_banner]")
 
-    if main_has_audio and tail > 0.001:
+    if use_tail:
         parts.append(f"[au_t_src]atrim=start={t1:.3f},asetpts=PTS-STARTPTS,{fmt}[au_tail]")
         parts.append("[au_head][au_banner][au_tail]concat=n=3:v=0:a=1[aout]")
     elif main_has_audio:
@@ -927,7 +1052,8 @@ def build_audio_insertion(main_has_audio, banner_has_audio, ins, want_banner_aud
 
 
 def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma, duration,
-                 position=None, content_box=None, content_fill=1.0, insertion_plan=None):
+                 position=None, content_box=None, content_fill=1.0, insertion_plan=None,
+                 freeze=True):
     out_w, out_h = out_size(video_w, video_h)
 
     # Сначала ужимаем исходник до потолка, и уже на ужатом кадре считаем
@@ -974,7 +1100,10 @@ def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma,
         chains.append("[banner_raw]null[banner_keyed]")
 
     if insertion_plan:
-        chains.extend(_filter_insertion(vsrc, pos_x, pos_y, insertion_plan, bw, bh))
+        if freeze:
+            chains.extend(_filter_insertion(vsrc, pos_x, pos_y, insertion_plan, bw, bh))
+        else:
+            chains.extend(_filter_insertion_live(vsrc, pos_x, pos_y, insertion_plan))
     else:
         chains.append(
             f"[{vsrc}][banner_keyed]overlay={pos_x}:{pos_y}:"
@@ -985,7 +1114,7 @@ def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma,
 
 
 def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0.0,
-                     position=None):
+                     position=None, freeze=None):
     config = load_brand(brand)
     vw, vh, _ = probe(input_vid)
     bw, bh, banner_duration = probe(banner_vid)
@@ -995,9 +1124,11 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
 
     insertion = resolve_insertion(config)
     ins = plan_insertion(duration, banner_duration, insertion) if insertion else None
+    stop_video = resolve_freeze(config, freeze)
     if ins:
         ins["total"] = duration
         ins["audio"] = bool(insertion.get("audio", True))
+        ins["freeze"] = stop_video
 
     # -hide_banner и -loglevel error: ffmpeg иначе печатает баннер и построчный
     # прогресс (для 59-секундного ролика это десятки килобайт), которые мы
@@ -1016,15 +1147,16 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
         cmd += ["-loop", "1", "-i", str(banner_vid)]
 
     filters, plan = build_filter(platform, vw, vh, bw, bh, config, chroma, duration,
-                                 position, content_box, content_fill, ins)
+                                 position, content_box, content_fill, ins, stop_video)
     plan["chroma"] = chroma
     plan["insertion"] = ins
+    plan["freeze"] = stop_video if ins else None
 
     audio_graph = None
     if ins:
         main_audio, banner_audio = has_audio(input_vid), has_audio(banner_vid)
         audio_graph = build_audio_insertion(main_audio, banner_audio, ins,
-                                            ins.get("audio", True))
+                                            ins.get("audio", True), stop_video)
         if audio_graph is None and not banner_audio:
             # Требование "со звуком" не закрыто: у баннера нет аудиодорожки.
             # Основной звук оставляем непрерывным, но факт сообщаем наружу.
@@ -1124,7 +1256,7 @@ def _run_ffmpeg(cmd):
         raise RuntimeError(f"ffmpeg упал (код {proc.returncode}):\n{tail}")
 
 
-def render(input_vid, banner_vid, out_vid, platform, brand, position=None):
+def render(input_vid, banner_vid, out_vid, platform, brand, position=None, freeze=None):
     src_w, src_h, duration = probe(input_vid)
 
     # Крупный кадр ужимаем отдельным проходом: колорокей и overlay поверх
@@ -1134,7 +1266,7 @@ def render(input_vid, banner_vid, out_vid, platform, brand, position=None):
             mid = Path(tmp) / "mid.mp4"
             _run_ffmpeg(build_prepass_cmd(input_vid, mid, duration))
             cmd, plan = build_ffmpeg_cmd(mid, banner_vid, out_vid, platform, brand,
-                                         duration, position)
+                                         duration, position, freeze)
             # Плану показываем исходник, а не промежуточный файл.
             plan["src_size"] = (src_w, src_h)
             plan["prepassed"] = True
@@ -1142,7 +1274,7 @@ def render(input_vid, banner_vid, out_vid, platform, brand, position=None):
         return plan
 
     cmd, plan = build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand,
-                                 duration, position)
+                                 duration, position, freeze)
     plan["prepassed"] = False
     _run_ffmpeg(cmd)
     return plan

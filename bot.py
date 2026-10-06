@@ -1,5 +1,6 @@
 import os
 import html
+import time
 import asyncio
 import threading
 from pathlib import Path
@@ -57,20 +58,51 @@ async def safe_edit(message: Message, text: str, **kwargs):
         raise
 
 
+async def ack(callback: CallbackQuery, text: str | None = None, *, alert: bool = False):
+    """Снимает «часики» с нажатой кнопки.
+
+    Telegram держит спиннер на inline-кнопке, пока бот не ответит на
+    callbackQuery. Без этого ответа юзер видит вечную загрузку, даже если
+    сообщение уже обновилось. Поэтому сначала ack, потом любая работа.
+    Повторный ответ на тот же query - не ошибка, молча глушим.
+    """
+    try:
+        await callback.answer(text, show_alert=alert)
+    except Exception:
+        pass
+
+
+# Проверка подписки - это запрос к Telegram при КАЖДОМ тапе по кнопке, то есть
+# лишний сетевой рундтайм прямо в горячем пути. Хватает минуты: кто отписался,
+# вернётся в «не подписан» через 60 секунд.
+_SUB_CACHE: dict[int, tuple[bool, float]] = {}
+_SUB_TTL = 60.0
+
+
 class VideoState(StatesGroup):
     chosen_platform = State()
     chosen_brand = State()
     chosen_variant = State()
     chosen_position = State()
+    chosen_freeze = State()
     waiting_for_video = State()
 
 
 async def is_subscribed(user_id: int) -> bool:
+    now = time.monotonic()
+    hit = _SUB_CACHE.get(user_id)
+    if hit and now - hit[1] < _SUB_TTL:
+        return hit[0]
     try:
         member = await bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        return member.status in ["member", "administrator", "creator"]
+        ok = member.status in ["member", "administrator", "creator"]
     except Exception:
-        return False
+        # Сетевая ошибка - это НЕ «не подписан». Раньше здесь возвращался False,
+        # обработчик молча завершался, и кнопка висела в загрузке вечно.
+        # Старое значение (если было) важнее свежей ошибки сети.
+        return hit[0] if hit else False
+    _SUB_CACHE[user_id] = (ok, now)
+    return ok
 
 
 def get_sub_keyboard():
@@ -110,6 +142,20 @@ POSITION_HINT = (
     "поверх ролика. Позиция привязана к краю кадра.</i>"
 )
 
+FREEZE_LABELS = {
+    True: "⏸ Ролик останавливается",
+    False: "▶️ Ролик идёт дальше",
+}
+
+FREEZE_HINT = (
+    "⏸ <b>Останавливать</b> — ролик замрёт на это время, баннер отыграет со "
+    "своим звуком, и ролик пойдёт дальше с того же места. Длина не изменится.\n\n"
+    "▶️ <b>Не останавливать</b> — ролик под баннером продолжает идти, звук "
+    "ролика остаётся, но на время баннера приглушается, чтобы был слышен "
+    "голос. Длина тоже не изменится.\n\n"
+    "<i>Баннер в обоих случаях показывается один раз в середине ролика.</i>"
+)
+
 
 def get_brands_keyboard(platform: str | None = None):
     builder = InlineKeyboardBuilder()
@@ -135,6 +181,7 @@ async def cmd_start(message: Message, state: FSMContext):
 @dp.callback_query(F.data == "check_sub")
 async def process_sub_check(callback: CallbackQuery):
     if await is_subscribed(callback.from_user.id):
+        await ack(callback)
         await safe_edit(callback.message,
             "✅ Доступ открыт.\n\n📱 Выбери платформу:", reply_markup=get_platforms_keyboard()
         )
@@ -144,6 +191,7 @@ async def process_sub_check(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "back_to_platforms")
 async def back_to_platforms(callback: CallbackQuery, state: FSMContext):
+    await ack(callback)
     await state.clear()
     await safe_edit(callback.message,
         "📱 Выбери формат/платформу:", reply_markup=get_platforms_keyboard()
@@ -152,12 +200,15 @@ async def back_to_platforms(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("plat_"))
 async def process_platform(callback: CallbackQuery, state: FSMContext):
-    if not await is_subscribed(callback.from_user.id):
-        return
     platform = callback.data.split("_", 1)[1]
     if platform not in render.list_platforms():
-        await callback.answer("❌ Неизвестная платформа", show_alert=True)
-        return
+        return await ack(callback, "❌ Неизвестная платформа", alert=True)
+    await ack(callback)
+    if not await is_subscribed(callback.from_user.id):
+        return await callback.message.answer(
+            "👋 Подпишись на канал, чтобы продолжить:",
+            reply_markup=get_sub_keyboard(),
+        )
     await state.update_data(chosen_platform=platform)
     await state.set_state(VideoState.chosen_brand)
     label = render.PLATFORM_LABELS.get(platform, platform.upper())
@@ -197,29 +248,63 @@ def get_positions_keyboard(brand: str | None = None):
     return builder.as_markup()
 
 
+def get_freeze_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text=FREEZE_LABELS[True], callback_data="frz_stop")
+    builder.button(text=FREEZE_LABELS[False], callback_data="frz_play")
+    builder.button(text="🔙 Назад", callback_data="back_to_positions")
+    builder.adjust(1, 1, 1)
+    return builder.as_markup()
+
+
+def needs_freeze_choice(config: dict) -> bool:
+    """Спрашивать ли, останавливать ли ролик.
+
+    Вопрос имеет смысл только там, где баннер вставляется один раз посреди
+    ролика. У баннера, который зациклен на весь ролик (Playerok), остановки в
+    принципе нет - спрашивать было бы враньём в интерфейсе.
+    """
+    return bool(render.resolve_insertion(config))
+
+
+async def ask_freeze_or_ready(message: Message, state: FSMContext, platform: str,
+                              brand: str, variant: str | None = None):
+    """После позиции: вопрос про остановку или сразу карточка перед роликом."""
+    config = render.load_brand(brand)
+    position = render.resolve_position(config, (await state.get_data()).get("chosen_position"))
+    await state.update_data(chosen_position=position)
+
+    if needs_freeze_choice(config):
+        await state.set_state(VideoState.chosen_freeze)
+        return await safe_edit(message,
+            f"✅ Формат: <b>{render.PLATFORM_LABELS.get(platform, (platform or '?').upper())}</b>\n"
+            f"Бренд: <b>{render.BRAND_LABELS.get(brand, config.get('title', brand))}</b>\n"
+            f"Позиция: <b>{render.POSITION_LABELS[position]}</b>\n\n"
+            f"{FREEZE_HINT}",
+            reply_markup=get_freeze_keyboard(),
+            parse_mode="HTML",
+        )
+
+    await state.set_state(VideoState.waiting_for_video)
+    return await send_ready_message(message, platform, brand, position, variant)
+
+
 async def finish_setup(message: Message, state: FSMContext, platform: str, brand: str,
                        variant: str | None = None):
     """Доводит выбор до конца и уводит в ожидание ролика.
 
-    Вопрос про позицию задаётся не всегда: у бренда с однократной вставкой и
-    insertion.position = "fixed" выбор всё равно игнорируется, и спрашивать
-    юзера про то, что потом не применяется, - враньё в интерфейсе. Такой бренд
-    сразу спрашивает ролик. С insertion.position = "user" (Musor Drop)
-    позиция выбирается как обычно.
+    Позиция спрашивается у ЛЮБОГО баннера: render.resolve_position отдаёт
+    выбор юзера наверх, а brand может запретить его явно через
+    insertion.position = "fixed". Раньше позиция спрашивалась не всегда, и у
+    баннера с фиксированной позицией вопроса не было вовсе.
     """
     config = render.load_brand(brand)
-    insertion = render.resolve_insertion(config)
-    if insertion and insertion.get("position") != "user":
-        position = render.resolve_position(config, None)
-        await state.update_data(chosen_position=position, chosen_variant=variant)
-        await state.set_state(VideoState.waiting_for_video)
-        return await send_ready_message(message, platform, brand, position, variant)
-
     await state.update_data(chosen_variant=variant)
     await state.set_state(VideoState.chosen_position)
+    label = render.BRAND_LABELS.get(brand, config.get("title", brand))
     return await safe_edit(message,
         f"✅ Формат: <b>{render.PLATFORM_LABELS.get(platform, (platform or '?').upper())}</b>\n"
-        f"Бренд: <b>{render.BRAND_LABELS.get(brand, config.get('title', brand))}</b>\n\n"
+        f"Бренд: <b>{label}</b>\n\n"
         f"Где поставить баннер?\n\n"
         f"{POSITION_HINT}",
         reply_markup=get_positions_keyboard(brand),
@@ -228,20 +313,33 @@ async def finish_setup(message: Message, state: FSMContext, platform: str, brand
 
 
 async def send_ready_message(message: Message, platform: str, brand: str, position: str,
-                              variant: str | None = None):
+                              variant: str | None = None, freeze: bool | None = None):
     """Финальная карточка перед отправкой ролика: что выбрано, куда ляжет
     баннер и сколько он занимает. Реклама обещаний не даём - только цифры."""
     config = render.load_brand(brand)
     label = render.BRAND_LABELS.get(brand, config.get("title", brand))
     platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
+    stop_video = render.resolve_freeze(config, freeze)
 
     banner_path = render.find_banner(brand, config, platform=platform, variant=variant)
 
+    # Без файла карточка собралась бы с нулями и упала на banner_path.name -
+    # исключение в обработчике означает НИКАКОГО ответа, то есть вечную
+    # загрузку на кнопке. Лучше честное «файла нет».
+    problem = _banner_problem(brand, platform, config, banner_path)
+    if problem:
+        return await safe_edit(message, problem, parse_mode="HTML")
+
     # Считаем раскладку заранее, чтобы предупредить про площадь сразу,
-    # а не через 3 минуты ожидания рендера.
+    # а не через 3 минуты ожидания рендера. В отдельном потоке: внутри ffprobe,
+    # а он блокирует event loop - бот на эти секунды переставал отвечать
+    # вообще ни на что, и тап по позиции выглядел как вечная загрузка.
     plan = None
     try:
-        plan = render.plan_banner(platform, banner_path, config, position=position)
+        plan = await asyncio.to_thread(
+            render.plan_banner, platform, banner_path, config,
+            position=position, freeze=stop_video,
+        )
     except Exception:
         pass
 
@@ -252,6 +350,12 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
         f"Формат: <b>{platform_label}</b>",
         f"Бренд: <b>{label}</b>",
         f"Баннер: <code>{banner_path.name}</code> · {render.POSITION_LABELS[position]}",
+    ]
+    # Режим остановки показываем, только если бот его спрашивал: у баннера
+    # без вставки остановки нет, и упоминать её в карточке нечестно.
+    if needs_freeze_choice(config):
+        lines.append(f"Ролик: <b>{FREEZE_LABELS[stop_video]}</b>")
+    lines += [
         "",
         "📎 <b>Прикрепи ролик файлом</b> или запиши кружочек — "
         "дальше всё сделает бот сам.",
@@ -286,20 +390,32 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
 
     # Требования к длине при однократной вставке: баннер занимает середину
     # ролика целиком, поэтому слишком короткий ролик вставка съедает целиком.
+    # Без остановки ролик продолжает идти под баннером, и та же вставка
+    # исходник не съедает - ограничение тогда не нужно.
     ins = (plan.get("insertion") or plan.get("insertion_required")) if plan else None
-    if ins:
+    if ins and stop_video:
         # Ролик ещё не загружен, поэтому конкретное окно вставки ещё неизвестно -
         # сообщаем правило и порог, а секунды скажем после загрузки ролика.
         min_total = ins.get("min_total") or render.min_total_duration(
             ins["banner_duration"], render.resolve_insertion(config))
         lines.append(f"• <b>не короче {min_total:.0f} секунд</b> — баннер идёт "
                      f"в середине ролика и занимает {ins['banner_duration']:.0f} сек")
-        lines += [
-            "",
-            f"🎞 Баннер покажется <b>один раз в середине</b>: ролик на "
-            f"{ins['banner_duration']:.0f} сек замрёт, баннер отыграет, "
-            f"ролик пойдёт дальше с того же места. Длина не изменится.",
-        ]
+    if ins:
+        if stop_video:
+            lines += [
+                "",
+                f"🎞 Баннер покажется <b>один раз в середине</b>: ролик на "
+                f"{ins['banner_duration']:.0f} сек замрёт, баннер отыграет, "
+                f"ролик пойдёт дальше с того же места. Длина не изменится.",
+            ]
+        else:
+            lines += [
+                "",
+                f"🎞 Баннер покажется <b>один раз в середине</b> поверх "
+                f"идущего ролика: {ins['banner_duration']:.0f} сек графики поверх "
+                f"видео, звук ролика на это время приглушится. "
+                f"Ролик не замрёт и длина не изменится.",
+            ]
     if plan and plan.get("audio_warning") == "no_banner_audio":
         lines += [
             "",
@@ -312,12 +428,17 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
 
 @dp.callback_query(F.data.startswith("pos_"))
 async def process_position(callback: CallbackQuery, state: FSMContext):
-    if not await is_subscribed(callback.from_user.id):
-        return
     position = callback.data.split("_", 1)[1]
     if position not in render.POSITIONS:
-        await callback.answer("❌ Неизвестная позиция", show_alert=True)
-        return
+        return await ack(callback, "❌ Неизвестная позиция", alert=True)
+    # Часики снимаем ДО всякой работы: дальше идут запрос к Telegram и
+    # расчёт плана (ffprobe), и без ack юзер смотрит на спиннер всё это время.
+    await ack(callback)
+    if not await is_subscribed(callback.from_user.id):
+        return await callback.message.answer(
+            "👋 Подпишись на канал, чтобы продолжить:",
+            reply_markup=get_sub_keyboard(),
+        )
 
     data = await state.get_data()
     platform = data.get("chosen_platform")
@@ -330,16 +451,67 @@ async def process_position(callback: CallbackQuery, state: FSMContext):
             reply_markup=get_platforms_keyboard(),
         )
 
+    # Выбранную позицию сразу нормализуем: мусор в state не должен увести
+    # баннер мимо POSITIONS.
+    config = render.load_brand(brand)
+    position = render.resolve_position(config, position)
     await state.update_data(chosen_position=position)
+    return await ask_freeze_or_ready(callback.message, state, platform, brand, variant)
+
+
+@dp.callback_query(F.data.startswith("frz_"))
+async def process_freeze(callback: CallbackQuery, state: FSMContext):
+    """Останавливать ли ролик на время вставки баннера."""
+    if callback.data not in ("frz_stop", "frz_play"):
+        return await ack(callback, "❌ Неизвестный вариант", alert=True)
+    await ack(callback)
+    if not await is_subscribed(callback.from_user.id):
+        return await callback.message.answer(
+            "👋 Подпишись на канал, чтобы продолжить:",
+            reply_markup=get_sub_keyboard(),
+        )
+
+    data = await state.get_data()
+    platform = data.get("chosen_platform")
+    brand = data.get("chosen_brand")
+    variant = data.get("chosen_variant")
+    if not platform or not brand:
+        await state.clear()
+        return await safe_edit(callback.message,
+            "❌ Сначала выбери платформу и бренд.",
+            reply_markup=get_platforms_keyboard(),
+        )
+
+    freeze = callback.data == "frz_stop"
+    await state.update_data(chosen_freeze=freeze)
     await state.set_state(VideoState.waiting_for_video)
-    await send_ready_message(callback.message, platform, brand, position, variant)
+    position = render.resolve_position(render.load_brand(brand),
+                                        data.get("chosen_position"))
+    return await send_ready_message(callback.message, platform, brand, position,
+                                    variant, freeze)
+
+
+@dp.callback_query(F.data == "back_to_positions")
+async def back_to_positions(callback: CallbackQuery, state: FSMContext):
+    await ack(callback)
+    data = await state.get_data()
+    brand = data.get("chosen_brand")
+    if not brand:
+        return await back_to_brands(callback, state)
+    await state.set_state(VideoState.chosen_position)
+    label = render.BRAND_LABELS.get(brand, render.load_brand(brand).get("title", brand))
+    await safe_edit(callback.message,
+        f"Бренд: <b>{label}</b>\n\n"
+        f"Где поставить баннер?\n\n"
+        f"{POSITION_HINT}",
+        reply_markup=get_positions_keyboard(brand),
+        parse_mode="HTML",
+    )
 
 
 @dp.callback_query(F.data.startswith("var_"))
 async def process_variant(callback: CallbackQuery, state: FSMContext):
     """Выбор варианта баннера внутри бренда: у FunPay это игры или сервисы."""
-    if not await is_subscribed(callback.from_user.id):
-        return
     variant = callback.data.split("_", 1)[1]
 
     data = await state.get_data()
@@ -347,6 +519,7 @@ async def process_variant(callback: CallbackQuery, state: FSMContext):
     brand = data.get("chosen_brand")
     if not platform or not brand:
         await state.clear()
+        await ack(callback)
         return await safe_edit(callback.message,
             "❌ Сначала выбери платформу и бренд.",
             reply_markup=get_platforms_keyboard(),
@@ -357,8 +530,13 @@ async def process_variant(callback: CallbackQuery, state: FSMContext):
     # вариантов: иначе в рендер уехал бы любой путь из сообщения.
     files = {v["file"] for v in render.list_variants(brand, config)}
     if variant not in files:
-        await callback.answer("❌ Неизвестный вариант", show_alert=True)
-        return
+        return await ack(callback, "❌ Неизвестный вариант", alert=True)
+    await ack(callback)
+    if not await is_subscribed(callback.from_user.id):
+        return await callback.message.answer(
+            "👋 Подпишись на канал, чтобы продолжить:",
+            reply_markup=get_sub_keyboard(),
+        )
 
     label = render.BRAND_LABELS.get(brand, config.get("title", brand))
     platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
@@ -371,6 +549,7 @@ async def process_variant(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "back_to_variants")
 async def back_to_variants(callback: CallbackQuery, state: FSMContext):
+    await ack(callback)
     data = await state.get_data()
     brand = data.get("chosen_brand")
     if not brand:
@@ -384,6 +563,7 @@ async def back_to_variants(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "back_to_brands")
 async def back_to_brands(callback: CallbackQuery, state: FSMContext):
+    await ack(callback)
     data = await state.get_data()
     platform = data.get("chosen_platform")
     await state.set_state(VideoState.chosen_brand)
@@ -399,14 +579,17 @@ async def back_to_brands(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data.startswith("brand_"))
 async def process_brand(callback: CallbackQuery, state: FSMContext):
-    if not await is_subscribed(callback.from_user.id):
-        return
     brand = callback.data.split("_", 1)[1]
     try:
         config = render.load_brand(brand)
     except FileNotFoundError:
-        await callback.answer("❌ Нет конфига бренда", show_alert=True)
-        return
+        return await ack(callback, "❌ Нет конфига бренда", alert=True)
+    await ack(callback)
+    if not await is_subscribed(callback.from_user.id):
+        return await callback.message.answer(
+            "👋 Подпишись на канал, чтобы продолжить:",
+            reply_markup=get_sub_keyboard(),
+        )
 
     await state.update_data(chosen_brand=brand)
 
@@ -448,7 +631,7 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
 
 
 def _media_problems(duration: int, width: int | None, height: int | None,
-                    banner_path, brand: str, config: dict) -> str | None:
+                    banner_path, brand: str, config: dict, stop_video: bool = True) -> str | None:
     """Общие проверки исходника. duration/width/height приходят из Telegram для
     файлов и из ffprobe для ссылок - правила одни и те же."""
     if duration > MAX_DURATION:
@@ -457,7 +640,9 @@ def _media_problems(duration: int, width: int | None, height: int | None,
     # Короткий ролик при однократной вставке отсекаем ДО рендера: баннер
     # занимает середину ролика целиком, и в 20-секундный ролик 20-секундный
     # баннер влезет только формально - исходника не останется ни до, ни после.
-    if banner_path and duration > 0:
+    # Без остановки ролик под баннером продолжает идти, поэтому тот же короткий
+    # ролик вставку переживает без потерь.
+    if banner_path and duration > 0 and stop_video:
         insertion = render.resolve_insertion(config)
         if insertion:
             _, _, banner_duration = render.probe(banner_path)
@@ -512,7 +697,7 @@ def _banner_problem(brand: str, platform: str, config: dict, banner_path) -> str
 async def _render_and_send(message: Message, state: FSMContext, msg: Message,
                             in_vid: Path, out_vid: Path, banner_path,
                             platform: str, brand: str, variant: str | None,
-                            position: str):
+                            position: str, stop_video: bool = True):
     """Рендерит баннер на уже скачанный исходник и отправляет результат.
 
     Скачивание файла из Telegram делает вызывающий и заодно создаёт msg для
@@ -545,7 +730,8 @@ async def _render_and_send(message: Message, state: FSMContext, msg: Message,
                 pass
 
     try:
-        vw, vh, _ = render.probe(in_vid)
+        # В отдельном потоке: ffprobe блокирует event loop на секунду.
+        vw, vh, _ = await asyncio.to_thread(render.probe, in_vid)
         ow, oh = render.out_size(vw, vh)
 
         # Рендер строго по одному: два параллельных ffmpeg на 512 МБ не
@@ -561,7 +747,8 @@ async def _render_and_send(message: Message, state: FSMContext, msg: Message,
             ticker = asyncio.create_task(keep_alive())
             try:
                 plan = await asyncio.to_thread(
-                    render.render, in_vid, banner_path, out_vid, platform, brand, position
+                    render.render, in_vid, banner_path, out_vid, platform, brand,
+                    position, stop_video
                 )
             finally:
                 ticker.cancel()
@@ -585,8 +772,16 @@ async def _render_and_send(message: Message, state: FSMContext, msg: Message,
         ins_note = ""
         if plan.get("insertion"):
             i = plan["insertion"]
-            ins_note = (f"\n🎞 Баннер один раз: {i['t_start']:.0f}–{i['t_end']:.0f} сек, "
-                        f"ролик на это время замрёт и пойдёт дальше без сдвига")
+            if stop_video:
+                ins_note = (f"\n🎞 Баннер один раз: {i['t_start']:.0f}–{i['t_end']:.0f} сек, "
+                            f"ролик на это время замрёт и пойдёт дальше без сдвига")
+            else:
+                # Без остановки окно одно и то же, но под баннером кадры идут
+                # дальше - поэтому в подписи это и написано, иначе юзер решит,
+                # что ролик всё-таки встал на паузу.
+                ins_note = (f"\n🎞 Баннер один раз поверх идущего ролика: "
+                            f"{i['t_start']:.0f}–{i['t_end']:.0f} сек, "
+                            f"ролик не останавливался, звук на это время приглушён")
             if plan.get("audio_warning") == "no_banner_audio":
                 ins_note += "\n🔇 У баннера нет звука — в этот момент продолжился звук ролика"
 
@@ -673,9 +868,13 @@ async def process_video(message: Message, state: FSMContext):
     # resolve_position гарантирует одну из POSITIONS и не даёт баннеру уехать
     # под кнопки интерфейса.
     position = render.resolve_position(config, data.get("chosen_position"))
+    # Режим остановки нормализуем тем же способом, что и позицию: мусор или
+    # старый state без этого ключа не должны молча ломать граф вставки.
+    stop_video = render.resolve_freeze(config, data.get("chosen_freeze"))
 
     problem = _media_problems(
-        duration, message.video.width, message.video.height, banner_path, brand, config
+        duration, message.video.width, message.video.height, banner_path, brand, config,
+        stop_video,
     ) or _banner_problem(brand, platform, config, banner_path)
     if problem:
         return await message.answer(problem, parse_mode="HTML")
@@ -711,8 +910,35 @@ async def process_video(message: Message, state: FSMContext):
             parse_mode="HTML",
         )
     return await _render_and_send(
-        message, state, msg, in_vid, out_vid, banner_path, platform, brand, variant, position
+        message, state, msg, in_vid, out_vid, banner_path, platform, brand, variant,
+        position, stop_video
     )
+
+
+async def prewarm_banners():
+    """Прогревает кэши замеров баннеров в фоне.
+
+    Холодный plan_banner - это 4-5 секунд ffprobe/ffmpeg, и без прогрева их
+    оплачивал бы первый же юзер, нажавший кнопку позиции. Кэш живёт в памяти
+    процесса, поэтому после каждого рестарта бота прогрев нужен заново.
+    """
+    for brand in render.list_brands():
+        try:
+            config = render.load_brand(brand)
+        except FileNotFoundError:
+            continue
+        targets = [(render.find_banner(brand, config, platform=p), p)
+                   for p in render.list_platforms()]
+        targets += [(v["path"], None) for v in render.list_variants(brand, config)]
+        for path, platform in targets:
+            if not path:
+                continue
+            try:
+                await asyncio.to_thread(render.plan_banner, platform, path, config)
+            except Exception:
+                # Прогрев - оптимизация, а не функция: упавший замер одного
+                # файла не должен ронять бота, его просто посчитают при клике.
+                pass
 
 
 def start_health_server(port: int) -> bool:
@@ -778,6 +1004,10 @@ async def main():
             print(f"  {brand}/вариант: OK {v['file']} — {v['title']}")
         if not per_platform and not render.find_banner(brand, config):
             print(f"  {brand}: НЕТ ФАЙЛА БАННЕРА")
+
+    # Прогрев в фоне, а не до polling: бот должен отвечать сразу после
+    # старта, а 4-5 секунд ffprobe на холодном старте уходят на замеры.
+    asyncio.create_task(prewarm_banners())
     await dp.start_polling(bot)
 
 
