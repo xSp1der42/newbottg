@@ -30,12 +30,6 @@ PLATFORM_LABELS = {
     "shorts": "YouTube Shorts",
 }
 
-PLATFORM_LABELS = {
-    "tiktok": "TikTok",
-    "insta": "Instagram Reels",
-    "shorts": "YouTube Shorts",
-}
-
 # Где может стоять баннер: три положения по вертикали, все привязаны к краям
 # кадра. Боковых нет намеренно - узкая колонка не набирает площадь из ТЗ.
 # Прячем ли баннер под интерфейс площадки, решают insets в configs/platforms.json,
@@ -999,17 +993,20 @@ def _filter_insertion(vsrc, pos_x, pos_y, ins, bw, bh):
         # длительность t0 + bd + (duration - t0) = duration + bd.
         # trim каркаса делаем по last-frame head, а не по отдельному кадру:
         # trim=start=t0:end=t0 даёт ноль кадров, и tpad клонировать нечего.
-        # fps=30 переводит VFR-видео с телефона в CFR: иначе tpad не знает
-        # длительность кадра и держит последний кадр ~0 секунд, из-за чего
-        # ролик не замирает на время баннера.
+        # setpts=PTS-STARTPTS обязан идти ПОСЛЕ tpad. На ffmpeg 7.x обратный
+        # порядок ломает stop_duration: tpad клонирует последний кадр на ~0с, и
+        # ролик не замирает на время баннера (видео короче звука). На 8+/9.x оба
+        # порядка работают. fps=30 дополнительно переводит VFR-видео в CFR.
         parts = []
         parts.append(f"[{vsrc}]fps=30,split=2[fh][ftail]")
         if t0 > 0.001:
-            parts.append(f"[fh]trim=end={t0:.3f},setpts=PTS-STARTPTS,"
-                         f"tpad=stop_mode=clone:stop_duration={bd:.3f}[head_hold]")
+            parts.append(f"[fh]trim=end={t0:.3f},"
+                         f"tpad=stop_mode=clone:stop_duration={bd:.3f},"
+                         f"setpts=PTS-STARTPTS[head_hold]")
         else:
-            parts.append(f"[fh]trim=end_frame=1,setpts=PTS-STARTPTS,"
-                         f"tpad=stop_mode=clone:stop_duration={bd:.3f}[head_hold]")
+            parts.append(f"[fh]trim=end_frame=1,"
+                         f"tpad=stop_mode=clone:stop_duration={bd:.3f},"
+                         f"setpts=PTS-STARTPTS[head_hold]")
         parts.append(f"[ftail]trim=start={t0:.3f},setpts=PTS-STARTPTS[tail]")
         parts.append("[head_hold][tail]concat=n=2:v=1:a=0[ins_base]")
         # Баннер играет один раз в окне остановки [t0, t0+bd].
@@ -1022,14 +1019,14 @@ def _filter_insertion(vsrc, pos_x, pos_y, ins, bw, bh):
         return parts
 
     freeze_win = max(0.0, t1 - t0)
-    # fps=30 - та же защита от VFR, что и в freeze-ветке: окно должно иметь
-    # строгие тайминги, иначе tpad/overlay промахнутся по длительности.
+    # Та же защита, что и в freeze-ветке: setpts после tpad (иначе на ffmpeg
+    # 7.x stop_duration теряется) и fps=30 для строгих таймингов окна.
     parts = [f"[{vsrc}]fps=30,split=2[ins_head_src][ins_tail_src]"]
     if freeze_win > 0.001:
         if t0 > 0.001:
-            parts.append(f"[ins_head_src]trim=start=0:end={t0:.3f},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={freeze_win:.3f}[ins_head]")
+            parts.append(f"[ins_head_src]trim=start=0:end={t0:.3f},tpad=stop_mode=clone:stop_duration={freeze_win:.3f},setpts=PTS-STARTPTS[ins_head]")
         else:
-            parts.append(f"[ins_head_src]trim=end_frame=1,setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={freeze_win:.3f}[ins_head]")
+            parts.append(f"[ins_head_src]trim=end_frame=1,tpad=stop_mode=clone:stop_duration={freeze_win:.3f},setpts=PTS-STARTPTS[ins_head]")
     else:
         parts.append(f"[ins_head_src]trim=start=0:end={t0:.3f},setpts=PTS-STARTPTS[ins_head]")
     parts.append(f"[ins_tail_src]trim=start={t1:.3f},setpts=PTS-STARTPTS[ins_tail]")
