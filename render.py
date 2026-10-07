@@ -644,30 +644,42 @@ def resolve_freeze(config, freeze=None):
     бы. freeze=None означает "юзер не выбирал" - тогда берём insertion.freeze,
     а при отсутствии вставки - True (вопрос и не задаётся в этом случае).
     """
-    ins = resolve_insertion(config) or {}
+    ins_base = resolve_insertion(config) or {}
     if freeze is None:
-        return bool(ins.get("freeze", True))
+        return bool(ins_base.get("freeze", True))
     return bool(freeze)
 
 
-def plan_insertion(duration, banner_duration, insertion):
+def plan_insertion(duration, banner_duration, insertion, freeze=False):
     """Окно вставки: (t_start, t_end) в секундах исходного ролика.
 
-    Баннер ставится по доле "at" от свободного времени, чтобы до и после
-    оставалось одинаковое количество исходника. Общая длительность ролика
-    при этом НЕ меняется: замерший кадр занимает ровно столько же времени,
-    сколько длится баннер.
+    - freeze=False (поверх идущего): общая длительность не меняется. Окно = t_start..t_start+banner_duration.
+    - freeze=True (останавливать): ролик встаёт на паузу на время баннера. После t_start
+      мы держим один и тот же кадр на протяжении banner_duration, потом продолжаем с t_start.
+      Итоговая длительность = duration + banner_duration.
     """
     if not insertion or duration <= 0 or banner_duration <= 0:
         return None
     free = duration - banner_duration
     if free < 0:
-        # Ролик короче баннера: вставляем от начала и обрезаем по длине ролика.
         t_start, t_end = 0.0, duration
     else:
         t_start = free * insertion["at"]
         t_end = t_start + banner_duration
     min_tail = float(insertion.get("min_tail", MIN_TAIL_SECONDS))
+    if freeze:
+        return {
+            "t_start": round(t_start, 3),
+            "t_end": round(t_start, 3),  # точка стыка после hold
+            "banner_duration": round(banner_duration, 3),
+            "at": insertion["at"],
+            "fits": free >= 0,
+            "min_tail": min_tail,
+            "has_head": t_start >= min_tail,
+            "has_tail": (duration - t_start) >= min_tail,  # хвост с t_start после паузы
+            "total_after_freeze": duration + banner_duration,
+            "freeze_extends": True,
+        }
     return {
         "t_start": round(t_start, 3),
         "t_end": round(min(t_end, duration), 3),
@@ -675,7 +687,6 @@ def plan_insertion(duration, banner_duration, insertion):
         "at": insertion["at"],
         "fits": free >= 0,
         "min_tail": min_tail,
-        # Хватает ли исходника по краям, чтобы вставка не съела ролик целиком.
         "has_head": t_start >= min_tail,
         "has_tail": (duration - t_end) >= min_tail,
     }
@@ -917,57 +928,47 @@ def out_size(video_w, video_h):
 
 
 def _filter_insertion(vsrc, pos_x, pos_y, ins, bw, bh):
-    """Граф фильтров для вставки баннера один раз в середину ролика.
-
-    Три шага:
-      1. Разрезаем исходник на голову (0..t_start) и хвост (t_end..конец).
-      2. Голову дополняем клоном последнего кадра на всю длину баннера -
-         это и есть "видео остановилось".
-      3. Накладываем баннер только внутри окна через enable=between(t,...),
-         поэтому после баннера он сам собой исчезает.
-
-    Метки исходника приходится раздваивать через split: один вход ffmpeg
-    нельзя использовать в двух цепочках.
-    """
-    t0, t1 = ins["t_start"], ins["t_end"]
-    freeze = max(0.0, t1 - t0)
-    parts = [
-        f"[{vsrc}]split=2[ins_head_src][ins_tail_src]",
-    ]
-    if freeze > 0.001:
+    t0 = float(ins["t_start"])
+    t1 = float(ins.get("t_end", t0))
+    bd = float(ins["banner_duration"])
+    if bool(ins.get("freeze")):
+        # Останавливаем ролик: head до t0, затем кадр t0 клонируется (tpad) на
+        # время баннера, затем хвост с t0. Склейка head_hold + tail даёт
+        # длительность t0 + bd + (duration - t0) = duration + bd.
+        # trim каркаса делаем по last-frame head, а не по отдельному кадру:
+        # trim=start=t0:end=t0 даёт ноль кадров, и tpad клонировать нечего.
+        parts = []
+        parts.append(f"[{vsrc}]split=2[fh][ftail]")
         if t0 > 0.001:
-            parts.append(
-                f"[ins_head_src]trim=start=0:end={t0:.3f},setpts=PTS-STARTPTS,"
-                f"tpad=stop_mode=clone:stop_duration={freeze:.3f}[ins_head]"
-            )
+            parts.append(f"[fh]trim=end={t0:.3f},setpts=PTS-STARTPTS,"
+                         f"tpad=stop_mode=clone:stop_duration={bd:.3f}[head_hold]")
         else:
-            # Ролик короче баннера: замораживать нечего, головы нет вовсе, а
-            # tpad клонирует последний кадр - клонировать нечего, и база
-            # получается пустой, то есть на выходе битый файл. Поэтому берём
-            # ровно один кадр (end_frame не зависит от частоты кадров, в отличие
-            # от end=0.04) и растягиваем его на всё окно.
-            parts.append(
-                f"[ins_head_src]trim=end_frame=1,setpts=PTS-STARTPTS,"
-                f"tpad=stop_mode=clone:stop_duration={freeze:.3f}[ins_head]"
-            )
-    else:
+            parts.append(f"[fh]trim=end_frame=1,setpts=PTS-STARTPTS,"
+                         f"tpad=stop_mode=clone:stop_duration={bd:.3f}[head_hold]")
+        parts.append(f"[ftail]trim=start={t0:.3f},setpts=PTS-STARTPTS[tail]")
+        parts.append("[head_hold][tail]concat=n=2:v=1:a=0[ins_base]")
+        # Баннер играет один раз в окне остановки [t0, t0+bd].
+        parts.append(f"[banner_keyed]setpts=PTS-STARTPTS+{t0:.3f}/TB[ins_banner]")
         parts.append(
-            f"[ins_head_src]trim=start=0:end={t0:.3f},setpts=PTS-STARTPTS[ins_head]"
+            f"[ins_base][ins_banner]overlay={pos_x}:{pos_y}:"
+            f"enable='between(t,{t0:.3f},{(t0 + bd):.3f})':"
+            f"eof_action=pass:shortest=0:format=auto[outv]"
         )
-    parts.append(
-        f"[ins_tail_src]trim=start={t1:.3f},setpts=PTS-STARTPTS[ins_tail]"
-    )
-    parts.append("[ins_head][ins_tail]concat=n=2:v=1:a=0[ins_base]")
+        return parts
 
-    # Баннер играет с нуля ровно в момент открытия окна, поэтому его таймлайн
-    # не просто сбрасывается, а сдвигается на t0. Без сдвига он играл бы по
-    # своей оси 0..20 и при t0=12.5 кончился бы на 20-й секунде, оставив
-    # последние 12.5 секунд окна вовсе без баннера.
+    freeze_win = max(0.0, t1 - t0)
+    parts = [f"[{vsrc}]split=2[ins_head_src][ins_tail_src]"]
+    if freeze_win > 0.001:
+        if t0 > 0.001:
+            parts.append(f"[ins_head_src]trim=start=0:end={t0:.3f},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={freeze_win:.3f}[ins_head]")
+        else:
+            parts.append(f"[ins_head_src]trim=end_frame=1,setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={freeze_win:.3f}[ins_head]")
+    else:
+        parts.append(f"[ins_head_src]trim=start=0:end={t0:.3f},setpts=PTS-STARTPTS[ins_head]")
+    parts.append(f"[ins_tail_src]trim=start={t1:.3f},setpts=PTS-STARTPTS[ins_tail]")
+    parts.append("[ins_head][ins_tail]concat=n=2:v=1:a=0[ins_base]")
     parts.append(f"[banner_keyed]setpts=PTS-STARTPTS+{t0:.3f}/TB[ins_banner]")
-    parts.append(
-        f"[ins_base][ins_banner]overlay={pos_x}:{pos_y}:"
-        f"enable='between(t,{t0:.3f},{t1:.3f})':eof_action=pass:shortest=0:format=auto[outv]"
-    )
+    parts.append(f"[ins_base][ins_banner]overlay={pos_x}:{pos_y}:enable='between(t,{t0:.3f},{t1:.3f})':eof_action=pass:shortest=0:format=auto[outv]")
     return parts
 
 
@@ -1130,8 +1131,9 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     content_box, content_fill = detect_content_box(banner_vid, config, chroma, with_fill=True)
 
     insertion = resolve_insertion(config)
-    ins = plan_insertion(duration, banner_duration, insertion) if insertion else None
     stop_video = resolve_freeze(config, freeze)
+    ins = plan_insertion(duration, banner_duration, insertion,
+                         freeze=bool(stop_video)) if insertion else None
     if ins:
         ins["total"] = duration
         ins["audio"] = bool(insertion.get("audio", True))
@@ -1206,7 +1208,8 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
         "-ar", "44100",
         "-movflags", "+faststart",
     ]
-    if duration > 0:
+    has_freeze = bool(freeze or (ins and ins.get("freeze")))
+    if duration > 0 and not has_freeze:
         cmd += ["-t", f"{duration:.3f}"]
     cmd += [str(out_vid)]
     return cmd, plan
