@@ -999,8 +999,11 @@ def _filter_insertion(vsrc, pos_x, pos_y, ins, bw, bh):
         # длительность t0 + bd + (duration - t0) = duration + bd.
         # trim каркаса делаем по last-frame head, а не по отдельному кадру:
         # trim=start=t0:end=t0 даёт ноль кадров, и tpad клонировать нечего.
+        # fps=30 переводит VFR-видео с телефона в CFR: иначе tpad не знает
+        # длительность кадра и держит последний кадр ~0 секунд, из-за чего
+        # ролик не замирает на время баннера.
         parts = []
-        parts.append(f"[{vsrc}]split=2[fh][ftail]")
+        parts.append(f"[{vsrc}]fps=30,split=2[fh][ftail]")
         if t0 > 0.001:
             parts.append(f"[fh]trim=end={t0:.3f},setpts=PTS-STARTPTS,"
                          f"tpad=stop_mode=clone:stop_duration={bd:.3f}[head_hold]")
@@ -1019,7 +1022,9 @@ def _filter_insertion(vsrc, pos_x, pos_y, ins, bw, bh):
         return parts
 
     freeze_win = max(0.0, t1 - t0)
-    parts = [f"[{vsrc}]split=2[ins_head_src][ins_tail_src]"]
+    # fps=30 - та же защита от VFR, что и в freeze-ветке: окно должно иметь
+    # строгие тайминги, иначе tpad/overlay промахнутся по длительности.
+    parts = [f"[{vsrc}]fps=30,split=2[ins_head_src][ins_tail_src]"]
     if freeze_win > 0.001:
         if t0 > 0.001:
             parts.append(f"[ins_head_src]trim=start=0:end={t0:.3f},setpts=PTS-STARTPTS,tpad=stop_mode=clone:stop_duration={freeze_win:.3f}[ins_head]")
