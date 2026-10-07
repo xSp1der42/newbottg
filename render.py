@@ -650,21 +650,61 @@ def resolve_freeze(config, freeze=None):
     return bool(freeze)
 
 
-def plan_insertion(duration, banner_duration, insertion, freeze=False):
+# Момент показа баннера внутри ролика. Доля свободного времени (duration -
+# длительность баннера), а не абсолютные секунды: так «в середине» выглядит
+# одинаково и для 15-секундного, и для минутного ролика. Значения - те же at,
+# что уже понимает plan_insertion.
+TIMING_AT = {"start": 0.0, "middle": 0.5, "end": 1.0}
+TIMING_LABELS = {
+    "start": "🔝 В начале",
+    "middle": "⏺ В середине",
+    "end": "🔚 В конце",
+}
+TIMING_HINT = (
+    "Когда показать баннер?\n\n"
+    "Ролик проигрывается до этой точки, затем врезка, затем продолжается "
+    "с того же места — длина ролика на паузе не теряется."
+)
+
+
+def resolve_timing(config, timing=None):
+    """Момент показа баннера, сведённый к одному из TIMING_AT.
+
+    Выбор юзера важнее настройки бренда. Если юзер не выбирал (или пришёл
+    мусор) - берём ближайший момент к insertion.at из конфига, поэтому старые
+    бренды без выбора и с at=0.5 продолжают показывать баннер в середине.
+    """
+    if timing in TIMING_AT:
+        return timing
+    at = (resolve_insertion(config) or {}).get("at", 0.5)
+    return min(TIMING_AT, key=lambda key: abs(TIMING_AT[key] - at))
+
+
+def timing_at(config, timing=None):
+    """Числовой at (0..1) для выбранного момента - вход в plan_insertion."""
+    return TIMING_AT[resolve_timing(config, timing)]
+
+
+def plan_insertion(duration, banner_duration, insertion, freeze=False, at=None):
     """Окно вставки: (t_start, t_end) в секундах исходного ролика.
 
     - freeze=False (поверх идущего): общая длительность не меняется. Окно = t_start..t_start+banner_duration.
     - freeze=True (останавливать): ролик встаёт на паузу на время баннера. После t_start
       мы держим один и тот же кадр на протяжении banner_duration, потом продолжаем с t_start.
       Итоговая длительность = duration + banner_duration.
+
+    at перекрывает insertion["at"], когда юзер выбрал момент кнопкой
+    (начало/середина/конец).
     """
     if not insertion or duration <= 0 or banner_duration <= 0:
         return None
+    at = insertion["at"] if at is None else float(at)
+    at = min(1.0, max(0.0, at))
     free = duration - banner_duration
     if free < 0:
         t_start, t_end = 0.0, duration
     else:
-        t_start = free * insertion["at"]
+        t_start = free * at
         t_end = t_start + banner_duration
     min_tail = float(insertion.get("min_tail", MIN_TAIL_SECONDS))
     if freeze:
@@ -672,7 +712,7 @@ def plan_insertion(duration, banner_duration, insertion, freeze=False):
             "t_start": round(t_start, 3),
             "t_end": round(t_start, 3),  # точка стыка после hold
             "banner_duration": round(banner_duration, 3),
-            "at": insertion["at"],
+            "at": at,
             "fits": free >= 0,
             "min_tail": min_tail,
             "has_head": t_start >= min_tail,
@@ -684,7 +724,7 @@ def plan_insertion(duration, banner_duration, insertion, freeze=False):
         "t_start": round(t_start, 3),
         "t_end": round(min(t_end, duration), 3),
         "banner_duration": round(banner_duration, 3),
-        "at": insertion["at"],
+        "at": at,
         "fits": free >= 0,
         "min_tail": min_tail,
         "has_head": t_start >= min_tail,
@@ -692,21 +732,39 @@ def plan_insertion(duration, banner_duration, insertion, freeze=False):
     }
 
 
-def min_total_duration(banner_duration, insertion):
+def min_total_duration(banner_duration, insertion, freeze=True, at=None):
     """Минимальная длина ролика, при которой вставка её не съедает.
 
     Считает ту же формулу, что plan_insertion (окно строится по доле at от
     свободного времени), поэтому проверка в боте и сам рендер не могут
-    разойтись: баннер в 20 с и минимум 3 с исходника по краям требуют 26 с.
+    разойтись.
+
+    Порог задаёт короткая сторона вставки от свободного времени free =
+    duration - banner_duration:
+
+    - freeze=True: хвост после паузы равен banner_duration + free*(1-at) и на
+      практике всегда большой, поэтому укорачивается только ГОЛОВА free*at.
+      Отсюда free >= min_tail/at, то есть duration >= banner_duration +
+      min_tail/at. at=0 - баннер в самом начале, головы нет, нужно лишь чтобы
+      ролик был длиннее баннера.
+    - freeze=False: баннер накладывается поверх идущего видео, нужны обе
+      стороны: free*at >= min_tail и free*(1-at) >= min_tail, то есть
+      free >= min_tail/min(at, 1-at).
+
     Бренд может разрешить меньше через insertion.min_tail.
     """
     if not insertion or banner_duration <= 0:
         return 0.0
-    at = insertion.get("at", 0.5)
+    at = insertion.get("at", 0.5) if at is None else float(at)
+    at = min(1.0, max(0.0, at))
     min_tail = float(insertion.get("min_tail", MIN_TAIL_SECONDS))
-    # Требование симметрично при at = 0.5; при других at нужно закрыть худший
-    # край, то есть max(at, 1 - at) от свободного времени.
-    tail = max(at, 1.0 - at)
+    if freeze:
+        if at <= 0.0:
+            return banner_duration
+        return banner_duration + min_tail / at
+    tail = min(at, 1.0 - at)
+    if tail <= 0.0:
+        return banner_duration + min_tail
     return banner_duration + min_tail / tail
 
 
@@ -866,7 +924,7 @@ def plan_overlay(platform, video_w, video_h, banner_w, banner_h, config, positio
 
 
 def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, position=None,
-                video_duration=0.0, freeze=None):
+                video_duration=0.0, freeze=None, timing=None):
     """Считает план раскладки баннера, ничего не рендеря.
 
     Нужно, чтобы показать пользователю размер и предупредить про площадь
@@ -894,7 +952,8 @@ def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, pos
     # честнее сказать на карточке, чем после двух минут ожидания.
     insertion = resolve_insertion(config)
     video_duration = float(video_duration or 0)
-    ins = plan_insertion(video_duration, banner_duration, insertion) if insertion else None
+    at = timing_at(config, timing)
+    ins = plan_insertion(video_duration, banner_duration, insertion, at=at) if insertion else None
     if ins:
         ins["freeze"] = resolve_freeze(config, freeze)
         plan["insertion"] = ins
@@ -905,7 +964,10 @@ def plan_banner(platform, banner_path, config, video_w=REF_W, video_h=REF_H, pos
         plan["insertion_required"] = {
             "mode": "once",
             "banner_duration": round(banner_duration, 3),
-            "min_total": min_total_duration(banner_duration, insertion),
+            "min_total": min_total_duration(
+                banner_duration, insertion,
+                freeze=resolve_freeze(config, freeze), at=at,
+            ),
             "audio": bool(insertion.get("audio", True)),
             "freeze": resolve_freeze(config, freeze),
         }
@@ -1122,7 +1184,7 @@ def build_filter(platform, video_w, video_h, banner_w, banner_h, config, chroma,
 
 
 def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0.0,
-                     position=None, freeze=None):
+                     position=None, freeze=None, timing=None):
     config = load_brand(brand)
     vw, vh, _ = probe(input_vid)
     bw, bh, banner_duration = probe(banner_vid)
@@ -1133,7 +1195,7 @@ def build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand, duration=0
     insertion = resolve_insertion(config)
     stop_video = resolve_freeze(config, freeze)
     ins = plan_insertion(duration, banner_duration, insertion,
-                         freeze=bool(stop_video)) if insertion else None
+                         freeze=bool(stop_video), at=timing_at(config, timing)) if insertion else None
     if ins:
         ins["total"] = duration
         ins["audio"] = bool(insertion.get("audio", True))
@@ -1266,7 +1328,8 @@ def _run_ffmpeg(cmd):
         raise RuntimeError(f"ffmpeg упал (код {proc.returncode}):\n{tail}")
 
 
-def render(input_vid, banner_vid, out_vid, platform, brand, position=None, freeze=None):
+def render(input_vid, banner_vid, out_vid, platform, brand, position=None, freeze=None,
+           timing=None):
     src_w, src_h, duration = probe(input_vid)
 
     # Крупный кадр ужимаем отдельным проходом: колорокей и overlay поверх
@@ -1276,7 +1339,7 @@ def render(input_vid, banner_vid, out_vid, platform, brand, position=None, freez
             mid = Path(tmp) / "mid.mp4"
             _run_ffmpeg(build_prepass_cmd(input_vid, mid, duration))
             cmd, plan = build_ffmpeg_cmd(mid, banner_vid, out_vid, platform, brand,
-                                         duration, position, freeze)
+                                         duration, position, freeze, timing)
             # Плану показываем исходник, а не промежуточный файл.
             plan["src_size"] = (src_w, src_h)
             plan["prepassed"] = True
@@ -1284,7 +1347,7 @@ def render(input_vid, banner_vid, out_vid, platform, brand, position=None, freez
         return plan
 
     cmd, plan = build_ffmpeg_cmd(input_vid, banner_vid, out_vid, platform, brand,
-                                 duration, position, freeze)
+                                 duration, position, freeze, timing)
     plan["prepassed"] = False
     _run_ffmpeg(cmd)
     return plan

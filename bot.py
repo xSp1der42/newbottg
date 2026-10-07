@@ -84,6 +84,7 @@ class VideoState(StatesGroup):
     chosen_brand = State()
     chosen_variant = State()
     chosen_position = State()
+    chosen_timing = State()
     chosen_freeze = State()
     waiting_for_video = State()
 
@@ -153,7 +154,8 @@ FREEZE_HINT = (
     "▶️ <b>Не останавливать</b> — ролик под баннером продолжает идти, звук "
     "ролика остаётся, но на время баннера приглушается, чтобы был слышен "
     "голос. Длина тоже не изменится.\n\n"
-    "<i>Баннер в обоих случаях показывается один раз в середине ролика.</i>"
+    "<i>Баннер в обоих случаях показывается один раз — в выбранный момент "
+    "ролика (начало / середина / конец).</i>"
 )
 
 
@@ -248,13 +250,32 @@ def get_positions_keyboard(brand: str | None = None):
     return builder.as_markup()
 
 
-def get_freeze_keyboard():
+def get_freeze_keyboard(back: str = "back_to_positions"):
     builder = InlineKeyboardBuilder()
     builder.button(text=FREEZE_LABELS[True], callback_data="frz_stop")
     builder.button(text=FREEZE_LABELS[False], callback_data="frz_play")
-    builder.button(text="🔙 Назад", callback_data="back_to_positions")
+    builder.button(text="🔙 Назад", callback_data=back)
     builder.adjust(1, 1, 1)
     return builder.as_markup()
+
+
+def get_timing_keyboard():
+    builder = InlineKeyboardBuilder()
+    for key in ("start", "middle", "end"):
+        builder.button(text=render.TIMING_LABELS[key], callback_data=f"tim_{key}")
+    builder.button(text="🔙 Назад", callback_data="back_to_positions")
+    builder.adjust(3, 1)
+    return builder.as_markup()
+
+
+def needs_timing_choice(config: dict) -> bool:
+    """Спрашивать ли, в какой момент ролика показать баннер.
+
+    Вопрос нужен только у вставок «отдельного» баннера (Musor Drop, BubaVPN):
+    включается в конфиге бренда через "timing_choice": true. У оверлеев поверх
+    идущего видео (FunPay) спрашивать нечего - там баннер просто висит.
+    """
+    return bool(config.get("timing_choice")) and bool(render.resolve_insertion(config))
 
 
 def needs_freeze_choice(config: dict) -> bool:
@@ -270,26 +291,53 @@ def needs_freeze_choice(config: dict) -> bool:
     return bool(config.get("freeze_choice")) and bool(render.resolve_insertion(config))
 
 
-async def ask_freeze_or_ready(message: Message, state: FSMContext, platform: str,
-                              brand: str, variant: str | None = None):
-    """После позиции: вопрос про остановку или сразу карточка перед роликом."""
+async def ask_timing_or_freeze(message: Message, state: FSMContext, platform: str,
+                               brand: str, variant: str | None = None):
+    """После позиции: вопрос про момент показа, иначе сразу к остановке."""
     config = render.load_brand(brand)
     position = render.resolve_position(config, (await state.get_data()).get("chosen_position"))
     await state.update_data(chosen_position=position)
 
-    if needs_freeze_choice(config):
-        await state.set_state(VideoState.chosen_freeze)
+    if needs_timing_choice(config):
+        await state.set_state(VideoState.chosen_timing)
         return await safe_edit(message,
             f"✅ Формат: <b>{render.PLATFORM_LABELS.get(platform, (platform or '?').upper())}</b>\n"
             f"Бренд: <b>{render.BRAND_LABELS.get(brand, config.get('title', brand))}</b>\n"
             f"Позиция: <b>{render.POSITION_LABELS[position]}</b>\n\n"
+            f"{render.TIMING_HINT}",
+            reply_markup=get_timing_keyboard(),
+            parse_mode="HTML",
+        )
+
+    return await ask_freeze_or_ready(message, state, platform, brand, variant)
+
+
+async def ask_freeze_or_ready(message: Message, state: FSMContext, platform: str,
+                              brand: str, variant: str | None = None):
+    """После момента (или сразу после позиции): вопрос про остановку или карточка."""
+    config = render.load_brand(brand)
+    data = await state.get_data()
+    position = render.resolve_position(config, data.get("chosen_position"))
+    await state.update_data(chosen_position=position)
+    timing = render.resolve_timing(config, data.get("chosen_timing"))
+
+    if needs_freeze_choice(config):
+        await state.set_state(VideoState.chosen_freeze)
+        # Назад с вопроса об остановке ведём туда, откуда пришли: к вопросу о
+        # моменте, если он был, иначе к позиции.
+        back = "back_to_timing" if needs_timing_choice(config) else "back_to_positions"
+        return await safe_edit(message,
+            f"✅ Формат: <b>{render.PLATFORM_LABELS.get(platform, (platform or '?').upper())}</b>\n"
+            f"Бренд: <b>{render.BRAND_LABELS.get(brand, config.get('title', brand))}</b>\n"
+            f"Позиция: <b>{render.POSITION_LABELS[position]}</b>\n"
+            f"Момент: <b>{render.TIMING_LABELS[timing]}</b>\n\n"
             f"{FREEZE_HINT}",
-            reply_markup=get_freeze_keyboard(),
+            reply_markup=get_freeze_keyboard(back),
             parse_mode="HTML",
         )
 
     await state.set_state(VideoState.waiting_for_video)
-    return await send_ready_message(message, platform, brand, position, variant)
+    return await send_ready_message(message, platform, brand, position, variant, timing=timing)
 
 
 async def finish_setup(message: Message, state: FSMContext, platform: str, brand: str,
@@ -316,13 +364,17 @@ async def finish_setup(message: Message, state: FSMContext, platform: str, brand
 
 
 async def send_ready_message(message: Message, platform: str, brand: str, position: str,
-                              variant: str | None = None, freeze: bool | None = None):
+                              variant: str | None = None, freeze: bool | None = None,
+                              timing: str | None = None):
     """Финальная карточка перед отправкой ролика: что выбрано, куда ляжет
     баннер и сколько он занимает. Реклама обещаний не даём - только цифры."""
     config = render.load_brand(brand)
     label = render.BRAND_LABELS.get(brand, config.get("title", brand))
     platform_label = render.PLATFORM_LABELS.get(platform, (platform or "?").upper())
     stop_video = render.resolve_freeze(config, freeze)
+    timing_key = render.resolve_timing(config, timing)
+    # "в начале" / "в середине" / "в конце" без эмодзи - для текста карточки.
+    moment = render.TIMING_LABELS[timing_key].split(" ", 1)[1].lower()
 
     banner_path = render.find_banner(brand, config, platform=platform, variant=variant)
 
@@ -341,7 +393,7 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
     try:
         plan = await asyncio.to_thread(
             render.plan_banner, platform, banner_path, config,
-            position=position, freeze=stop_video,
+            position=position, freeze=stop_video, timing=timing,
         )
     except Exception:
         pass
@@ -358,6 +410,10 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
     # без вставки остановки нет, и упоминать её в карточке нечестно.
     if needs_freeze_choice(config):
         lines.append(f"Ролик: <b>{FREEZE_LABELS[stop_video]}</b>")
+    if needs_timing_choice(config):
+        lines.append(f"Момент: <b>{render.TIMING_LABELS[timing_key]}</b>")
+    if needs_timing_choice(config):
+        lines.append(f"Момент: <b>{render.TIMING_LABELS[timing_key]}</b>")
     lines += [
         "",
         "📎 <b>Прикрепи ролик файлом</b> или запиши кружочек — "
@@ -400,21 +456,22 @@ async def send_ready_message(message: Message, platform: str, brand: str, positi
         # Ролик ещё не загружен, поэтому конкретное окно вставки ещё неизвестно -
         # сообщаем правило и порог, а секунды скажем после загрузки ролика.
         min_total = ins.get("min_total") or render.min_total_duration(
-            ins["banner_duration"], render.resolve_insertion(config))
+            ins["banner_duration"], render.resolve_insertion(config),
+            freeze=stop_video, at=render.timing_at(config, timing))
         lines.append(f"• <b>не короче {min_total:.0f} секунд</b> — баннер идёт "
-                     f"в середине ролика и занимает {ins['banner_duration']:.0f} сек")
+                     f"{moment} ролика и занимает {ins['banner_duration']:.0f} сек")
     if ins:
         if stop_video:
             lines += [
                 "",
-                f"🎞 Баннер покажется <b>один раз в середине</b>: ролик на "
+                f"🎞 Баннер покажется <b>один раз {moment}</b>: ролик на "
                 f"{ins['banner_duration']:.0f} сек замрёт, баннер отыграет, "
                 f"ролик пойдёт дальше с того же места. Длина не изменится.",
             ]
         else:
             lines += [
                 "",
-                f"🎞 Баннер покажется <b>один раз в середине</b> поверх "
+                f"🎞 Баннер покажется <b>один раз {moment}</b> поверх "
                 f"идущего ролика: {ins['banner_duration']:.0f} сек графики поверх "
                 f"видео, звук ролика на это время приглушится. "
                 f"Ролик не замрёт и длина не изменится.",
@@ -459,6 +516,34 @@ async def process_position(callback: CallbackQuery, state: FSMContext):
     config = render.load_brand(brand)
     position = render.resolve_position(config, position)
     await state.update_data(chosen_position=position)
+    return await ask_timing_or_freeze(callback.message, state, platform, brand, variant)
+
+
+@dp.callback_query(F.data.startswith("tim_"))
+async def process_timing(callback: CallbackQuery, state: FSMContext):
+    """В какой момент ролика показать баннер: начало / середина / конец."""
+    timing = callback.data.split("_", 1)[1]
+    if timing not in render.TIMING_AT:
+        return await ack(callback, "❌ Неизвестный момент", alert=True)
+    await ack(callback)
+    if not await is_subscribed(callback.from_user.id):
+        return await callback.message.answer(
+            "👋 Подпишись на канал, чтобы продолжить:",
+            reply_markup=get_sub_keyboard(),
+        )
+
+    data = await state.get_data()
+    platform = data.get("chosen_platform")
+    brand = data.get("chosen_brand")
+    variant = data.get("chosen_variant")
+    if not platform or not brand:
+        await state.clear()
+        return await safe_edit(callback.message,
+            "❌ Сначала выбери платформу и бренд.",
+            reply_markup=get_platforms_keyboard(),
+        )
+
+    await state.update_data(chosen_timing=timing)
     return await ask_freeze_or_ready(callback.message, state, platform, brand, variant)
 
 
@@ -491,7 +576,7 @@ async def process_freeze(callback: CallbackQuery, state: FSMContext):
     position = render.resolve_position(render.load_brand(brand),
                                         data.get("chosen_position"))
     return await send_ready_message(callback.message, platform, brand, position,
-                                    variant, freeze)
+                                    variant, freeze, data.get("chosen_timing"))
 
 
 @dp.callback_query(F.data == "back_to_positions")
@@ -512,7 +597,25 @@ async def back_to_positions(callback: CallbackQuery, state: FSMContext):
     )
 
 
-@dp.callback_query(F.data.startswith("var_"))
+@dp.callback_query(F.data == "back_to_timing")
+async def back_to_timing(callback: CallbackQuery, state: FSMContext):
+    await ack(callback)
+    data = await state.get_data()
+    brand = data.get("chosen_brand")
+    if not brand:
+        return await back_to_brands(callback, state)
+    config = render.load_brand(brand)
+    # Если у бренда момента не спрашивают - ведём прямо на позицию.
+    if not needs_timing_choice(config):
+        return await back_to_positions(callback, state)
+    await state.set_state(VideoState.chosen_timing)
+    label = render.BRAND_LABELS.get(brand, config.get("title", brand))
+    await safe_edit(callback.message,
+        f"Бренд: <b>{label}</b>\n\n"
+        f"{render.TIMING_HINT}",
+        reply_markup=get_timing_keyboard(),
+        parse_mode="HTML",
+    )
 async def process_variant(callback: CallbackQuery, state: FSMContext):
     """Выбор варианта баннера внутри бренда: у FunPay это игры или сервисы."""
     variant = callback.data.split("_", 1)[1]
@@ -634,7 +737,8 @@ async def process_brand(callback: CallbackQuery, state: FSMContext):
 
 
 def _media_problems(duration: int, width: int | None, height: int | None,
-                    banner_path, brand: str, config: dict, stop_video: bool = True) -> str | None:
+                    banner_path, brand: str, config: dict, stop_video: bool = True,
+                    timing: str | None = None) -> str | None:
     """Общие проверки исходника. duration/width/height приходят из Telegram для
     файлов и из ffprobe для ссылок - правила одни и те же."""
     if duration > MAX_DURATION:
@@ -649,17 +753,20 @@ def _media_problems(duration: int, width: int | None, height: int | None,
         insertion = render.resolve_insertion(config)
         if insertion:
             _, _, banner_duration = render.probe(banner_path)
-            min_total = render.min_total_duration(banner_duration, insertion)
+            min_total = render.min_total_duration(
+                banner_duration, insertion,
+                freeze=stop_video, at=render.timing_at(config, timing),
+            )
             if duration < min_total:
+                moment = render.TIMING_LABELS[
+                    render.resolve_timing(config, timing)].split(" ", 1)[1].lower()
                 return (
                     f"❌ <b>Ролик короче {min_total:.0f} секунд</b> "
                     f"({duration} сек).\n\n"
-                    f"Баннер {render.BRAND_LABELS.get(brand, config.get('title', brand))} "
-                    f"показывается один раз в середине ролика и "
-                    f"занимает {banner_duration:.0f} сек, а до и после него должно "
-                    f"остаться хотя бы {insertion.get('min_tail', render.MIN_TAIL_SECONDS):g} сек "
-                    f"исходника — иначе вставка съедает ролик целиком.\n\n"
-                    f"📱 Возьми ролик подлиннее или вырежи лишнее."
+                    f"Баннер идёт {moment} ролика: он занимает "
+                    f"{banner_duration:.0f} сек, и при выбранном моменте "
+                    f"исходника рядом не остаётся.\n\n"
+                    f"📱 Возьми ролик подлиннее или выбери другой момент."
                 )
 
     # Отсекаем горизонтальные ролики: safe zones заданы под вертикальный 9:16,
@@ -700,7 +807,8 @@ def _banner_problem(brand: str, platform: str, config: dict, banner_path) -> str
 async def _render_and_send(message: Message, state: FSMContext, msg: Message,
                             in_vid: Path, out_vid: Path, banner_path,
                             platform: str, brand: str, variant: str | None,
-                            position: str, stop_video: bool = True):
+                            position: str, stop_video: bool = True,
+                            timing: str | None = None):
     """Рендерит баннер на уже скачанный исходник и отправляет результат.
 
     Скачивание файла из Telegram делает вызывающий и заодно создаёт msg для
@@ -751,7 +859,7 @@ async def _render_and_send(message: Message, state: FSMContext, msg: Message,
             try:
                 plan = await asyncio.to_thread(
                     render.render, in_vid, banner_path, out_vid, platform, brand,
-                    position, stop_video
+                    position, stop_video, timing
                 )
             finally:
                 ticker.cancel()
@@ -874,10 +982,13 @@ async def process_video(message: Message, state: FSMContext):
     # Заморозку тоже достаём сразу: в state её может ещё не быть, но
     # resolve_freeze корректно обработает None.
     stop_video = render.resolve_freeze(config, data.get("chosen_freeze"))
+    # Момент показа (начало/середина/конец). None - бот его не спрашивал,
+    # resolve_timing возьмёт at из конфига бренда.
+    timing = data.get("chosen_timing")
 
     problem = _media_problems(
         duration, message.video.width, message.video.height, banner_path, brand, config,
-        stop_video,
+        stop_video, timing,
     ) or _banner_problem(brand, platform, config, banner_path)
     if problem:
         return await message.answer(problem, parse_mode="HTML")
@@ -917,7 +1028,7 @@ async def process_video(message: Message, state: FSMContext):
         )
     return await _render_and_send(
         message, state, msg, in_vid, out_vid, banner_path, platform, brand, variant,
-        position, stop_video
+        position, stop_video, data.get("chosen_timing")
     )
 
 
